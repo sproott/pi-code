@@ -343,9 +343,9 @@ export function postToolFeedback(result: HookRunResult, eventName: string, isErr
   return lines
 }
 
-/** A blocked tool_call verdict carrying pi's `terminate` flag (#7715): with it set on
- * an all-terminating tool batch, pi skips the automatic follow-up model call that a plain
- * block would otherwise pay for. */
+/** A blocked tool_call verdict without pi's `terminate` flag (#7715), allowing
+ * the agent to receive the denial as tool feedback and automatically continue
+ * with a follow-up model call, even when all tool calls in the batch are blocked. */
 export function blockedToolCall(reason: string | undefined): ToolCallEventResult {
-  return { block: true, reason, terminate: true }
+  return { block: true, reason }
 }
