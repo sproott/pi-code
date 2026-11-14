@@ -130,8 +130,12 @@ function unreachable(value: never): never {
   throw new Error(`Unhandled ${JSON.stringify(value)}`)
 }
 
+function checkboxGlyph(checked: boolean): string {
+  return checked ? '[✔] ' : '[ ] '
+}
+
 function checkbox(checked: boolean, theme: Theme): string {
-  return checked ? theme.fg('success', '[✔] ') : theme.fg('text', '[ ] ')
+  return theme.fg(checked ? 'success' : 'text', checkboxGlyph(checked))
 }
 
 /** `field` is a pre-rendered text field appended after the label, `box` a rendered checkbox
@@ -369,7 +373,7 @@ export default function question(pi: ExtensionAPI) {
 
       const results: QuestionResult[] = []
       for (const spec of specs) {
-        const result = await askOne(spec, ctx, pi.events, signal)
+        const result = await askOne(spec, specs.length === 1, ctx, pi.events, signal)
         results.push(result)
         if (result.details.answer === null) {
           // Only the user's cancel declines the call; an error (no UI, no options) keeps its own text.
@@ -531,7 +535,7 @@ function offerRemoteQuestion(params: QuestionSpec, ctx: ExtensionContext, events
   }
 }
 
-async function askOne(spec: QuestionSpec, ctx: ExtensionContext, events: ExtensionAPI['events'] | undefined, signal: AbortSignal | undefined): Promise<QuestionResult> {
+async function askOne(spec: QuestionSpec, lone: boolean, ctx: ExtensionContext, events: ExtensionAPI['events'] | undefined, signal: AbortSignal | undefined): Promise<QuestionResult> {
   if (!ctx.hasUI) {
     return {
       content: [{ type: 'text', text: 'Error: UI not available (running in non-interactive mode)' }],
@@ -544,7 +548,7 @@ async function askOne(spec: QuestionSpec, ctx: ExtensionContext, events: Extensi
   // ui.custom() is terminal-only: in RPC mode it resolves undefined without asking.
   // askUserQuestionTimeout needs a keyboard and a visible countdown, so dialogs do not apply it.
   if (ctx.mode === 'tui') return overlayResult([spec], await askViaOverlay([spec], ctx, askUserQuestionTimeoutMs(), events, signal))
-  return answerToResult(spec, await askViaDialogs(spec, ctx))
+  return answerToResult(spec, await askViaDialogs(spec, lone, ctx, signal))
 }
 
 /** A lone question's own result, or several joined under their questions. */
@@ -975,18 +979,19 @@ export async function askViaOverlay(specs: QuestionSpec[], ctx: ExtensionContext
 
 /** Dialog-primitive fallback for UI without a terminal (RPC mode supports
  * select/input/notify but not custom components). A dismissed dialog reads as a
- * cancel, same as Escape in the overlay. */
-async function askViaDialogs(params: QuestionSpec, ctx: ExtensionContext): Promise<QuestionAnswer> {
+ * cancel, same as Escape in the overlay. undefined is an unanswered question. */
+async function askViaDialogs(params: QuestionSpec, lone: boolean, ctx: ExtensionContext, signal?: AbortSignal): Promise<QuestionAnswer | undefined> {
   const title = params.header ? `[${params.header}] ${params.question}` : params.question
+  if (params.multiSelect) return askMultiViaDialogs(params, lone, title, ctx, signal)
   // Number the labels: ctx.ui.select returns the chosen label string, so duplicate
   // labels (or a model-supplied option named like the free-text entry) would be
   // ambiguous by text alone; the number is the unambiguous way back to the option.
-  const labels = [...params.options.map((option) => option.label), ...(params.multiSelect ? [] : ['Type something.'])].map((label, i) => `${i + 1}. ${label}`)
-  const choice = await ctx.ui.select(title, labels)
+  const labels = [...params.options.map((option) => option.label), 'Type something.'].map((label, i) => `${i + 1}. ${label}`)
+  const choice = await ctx.ui.select(title, labels, { signal })
   if (choice === undefined) return null
   const index = labels.indexOf(choice)
   if (index === params.options.length) {
-    const typed = await ctx.ui.input(params.question, 'Your answer')
+    const typed = await ctx.ui.input(params.question, 'Your answer', { signal })
     // A dismissed dialog cancels; a submitted empty answer is an (empty) answer, not a
     // cancel, so one accidental blank Enter does not abort the rest of a question batch.
     if (typed === undefined) return null
@@ -994,5 +999,55 @@ async function askViaDialogs(params: QuestionSpec, ctx: ExtensionContext): Promi
   }
   // A choice outside the offered labels cannot name an option.
   if (index < 0) return null
-  return params.multiSelect ? { kind: 'multi', indices: [index] } : { kind: 'option', index }
+  return { kind: 'option', index }
+}
+
+type MultiPick = { kind: 'toggle'; index: number } | { kind: 'type' } | { kind: 'done' }
+
+/** One round: the options and the text row numbered and boxed as on the overlay, then
+ * Done. undefined is a dismissed dialog or a choice that is not one of the entries. */
+async function pickMulti(params: QuestionSpec, title: string, ctx: ExtensionContext, checked: boolean[], text: string, signal: AbortSignal | undefined): Promise<MultiPick | undefined> {
+  const rows = [...params.options.map((option, i) => checkboxGlyph(checked[i]) + option.label), checkboxGlyph(text !== '') + (text || `${textRowLabel(true)}…`)]
+  const entries = [...rows.map((row, i) => `${i + 1}. ${row}`), 'Done']
+  const choice = await ctx.ui.select(title, entries, { signal })
+  const index = choice === undefined ? -1 : entries.indexOf(choice)
+  if (index < 0) return undefined
+  if (index < params.options.length) return { kind: 'toggle', index }
+  return index === params.options.length ? { kind: 'type' } : { kind: 'done' }
+}
+
+/** Bounds the picks of one multiSelect question, so a client that never picks Done
+ * cannot keep the call open; the schema's four options fit well within it. */
+const MULTI_SELECT_ROUNDS = 32
+
+/** A select with no checkbox mode: each pick toggles an option or edits the text row,
+ * until Done. Running out of rounds or a turn abort cancels, so a partial selection is never sent. */
+async function askMultiViaDialogs(params: QuestionSpec, lone: boolean, title: string, ctx: ExtensionContext, signal: AbortSignal | undefined): Promise<QuestionAnswer | undefined> {
+  const checked = params.options.map(() => false)
+  let text = ''
+  for (let round = 0; round < MULTI_SELECT_ROUNDS && !signal?.aborted; round++) {
+    const pick = await pickMulti(params, title, ctx, checked, text, signal)
+    switch (pick?.kind) {
+      case undefined:
+        return null
+      case 'done':
+        if (checked.some(Boolean) || text) return multiAnswer(checked, text)
+        // Nothing filled in leaves a batch question unanswered; a lone question asks again, as on the overlay.
+        if (!lone) return undefined
+        break
+      case 'toggle':
+        checked[pick.index] = !checked[pick.index]
+        break
+      case 'type': {
+        // pi's input dialog has no prefill, so the current text is its placeholder.
+        const typed = await ctx.ui.input(params.question, text || 'Your answer', { signal })
+        if (typed === undefined) return null
+        text = typed.trim()
+        break
+      }
+      default:
+        unreachable(pick)
+    }
+  }
+  return null
 }
