@@ -284,20 +284,22 @@ function withoutUserConfigShellCommands(raw: string, source: string): string {
 export function loadPluginHooks(config: HooksConfig, plugins: InstalledPlugin[], sources?: Map<HookMatcher, string>): void {
   for (const plugin of plugins) {
     const declared = plugin.manifest.hooks
-    // An inline hooks object; an array is not a valid hooks map (it would parse to
-    // numeric event keys), so it falls through to the default path rather than
-    // silently registering nothing.
-    if (declared !== null && typeof declared === 'object' && !Array.isArray(declared)) {
-      const inlineSource = `${plugin.name} (plugin.json)`
-      mergeHooksJson(config, substitutePluginVars(withoutUserConfigShellCommands(JSON.stringify({ hooks: declared }), inlineSource), plugin, jsonEscape), inlineSource, sources, `plugin:${plugin.name}`, plugin)
-      continue
-    }
-    const file = pluginComponentPath(plugin, typeof declared === 'string' ? declared : path.join('hooks', 'hooks.json'))
-    if (file === undefined) continue
-    try {
-      mergeHooksJson(config, substitutePluginVars(withoutUserConfigShellCommands(fs.readFileSync(file, 'utf-8'), file), plugin, jsonEscape), file, sources, `plugin:${plugin.name}`, plugin)
-    } catch {
-      // a plugin without hooks contributes nothing
+    // Claude accepts one path, one inline hooks object, or a list mixing both.
+    const entries = declared === undefined || declared === null ? [path.join('hooks', 'hooks.json')] : Array.isArray(declared) ? declared : [declared]
+    for (const entry of entries) {
+      if (entry !== null && typeof entry === 'object' && !Array.isArray(entry)) {
+        const inlineSource = `${plugin.name} (plugin.json)`
+        mergeHooksJson(config, substitutePluginVars(withoutUserConfigShellCommands(JSON.stringify({ hooks: entry }), inlineSource), plugin, jsonEscape), inlineSource, sources, `plugin:${plugin.name}`, plugin)
+        continue
+      }
+      if (typeof entry !== 'string') continue
+      const file = pluginComponentPath(plugin, entry)
+      if (file === undefined) continue
+      try {
+        mergeHooksJson(config, substitutePluginVars(withoutUserConfigShellCommands(fs.readFileSync(file, 'utf-8'), file), plugin, jsonEscape), file, sources, `plugin:${plugin.name}`, plugin)
+      } catch {
+        // a missing or unreadable hooks file contributes nothing
+      }
     }
   }
 }
