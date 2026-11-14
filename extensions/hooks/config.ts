@@ -286,21 +286,24 @@ export function loadPluginHooks(config: HooksConfig, plugins: InstalledPlugin[],
     const declared = plugin.manifest.hooks
     // Claude accepts one path, one inline hooks object, or a list mixing both.
     const entries = declared === undefined || declared === null ? [path.join('hooks', 'hooks.json')] : Array.isArray(declared) ? declared : [declared]
-    for (const entry of entries) {
-      if (entry !== null && typeof entry === 'object' && !Array.isArray(entry)) {
-        const inlineSource = `${plugin.name} (plugin.json)`
-        mergeHooksJson(config, substitutePluginVars(withoutUserConfigShellCommands(JSON.stringify({ hooks: entry }), inlineSource), plugin, jsonEscape), inlineSource, sources, `plugin:${plugin.name}`, plugin)
-        continue
-      }
-      if (typeof entry !== 'string') continue
-      const file = pluginComponentPath(plugin, entry)
-      if (file === undefined) continue
-      try {
-        mergeHooksJson(config, substitutePluginVars(withoutUserConfigShellCommands(fs.readFileSync(file, 'utf-8'), file), plugin, jsonEscape), file, sources, `plugin:${plugin.name}`, plugin)
-      } catch {
-        // a missing or unreadable hooks file contributes nothing
-      }
-    }
+    for (const entry of entries) loadPluginHooksEntry(config, plugin, entry, sources)
+  }
+}
+
+/** One manifest `hooks` entry: an inline hooks object or a path to a hooks file. */
+function loadPluginHooksEntry(config: HooksConfig, plugin: InstalledPlugin, entry: unknown, sources?: Map<HookMatcher, string>): void {
+  if (isRecord(entry)) {
+    const inlineSource = `${plugin.name} (plugin.json)`
+    mergeHooksJson(config, substitutePluginVars(withoutUserConfigShellCommands(JSON.stringify({ hooks: entry }), inlineSource), plugin, jsonEscape), inlineSource, sources, `plugin:${plugin.name}`, plugin)
+    return
+  }
+  if (typeof entry !== 'string') return
+  const file = pluginComponentPath(plugin, entry)
+  if (file === undefined) return
+  try {
+    mergeHooksJson(config, substitutePluginVars(withoutUserConfigShellCommands(fs.readFileSync(file, 'utf-8'), file), plugin, jsonEscape), file, sources, `plugin:${plugin.name}`, plugin)
+  } catch {
+    // a missing or unreadable hooks file contributes nothing
   }
 }
 
