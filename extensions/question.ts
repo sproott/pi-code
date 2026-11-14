@@ -74,7 +74,9 @@ export interface QuestionSpec {
 
 /** In-process, question-owned offer; arbitrary custom TUI components are not sent. */
 export const REMOTE_QUESTION_CHANNEL = 'pi-code:question:v1'
-export type RemoteQuestionOutcome = { action: 'answer'; indices: number[] } | { action: 'text'; text: string } | { action: 'cancel' } | { action: 'pass' }
+/** On a multiSelect question, `answer` takes an optional `text` sent along with the
+ * checked options, and `text` alone checks nothing. A single-select `answer` ignores `text`. */
+export type RemoteQuestionOutcome = { action: 'answer'; indices: number[]; text?: string } | { action: 'text'; text: string } | { action: 'cancel' } | { action: 'pass' }
 
 export interface RemoteQuestionOffer {
   version: 1
@@ -548,18 +550,37 @@ function validIndices(indices: unknown, count: number, multiSelect: boolean): in
  * pass or anything this question cannot accept, which must never become an answer. */
 function remoteAnswer(outcome: RemoteQuestionOutcome, options: OptionWithDesc[], multiSelect: boolean, allowFreeText: boolean): QuestionAnswer | undefined {
   if (outcome === null || typeof outcome !== 'object') return undefined
-  if (outcome.action === 'cancel') return null
-  if (outcome.action === 'text') {
-    const text = typeof outcome.text === 'string' ? outcome.text.trim() : ''
-    return allowFreeText && text ? { kind: 'text', text } : undefined
+  switch (outcome.action) {
+    case 'cancel':
+      return null
+    case 'text': {
+      const text = typeof outcome.text === 'string' ? outcome.text.trim() : ''
+      if (!allowFreeText || !text) return undefined
+      return multiSelect ? multiAnswer([], text) : { kind: 'text', text }
+    }
+    case 'answer':
+      return remoteOptionsAnswer(outcome, options, multiSelect)
+    default:
+      return undefined
   }
-  if (outcome.action !== 'answer') return undefined
+}
+
+function remoteOptionsAnswer(outcome: Extract<RemoteQuestionOutcome, { action: 'answer' }>, options: OptionWithDesc[], multiSelect: boolean): Answer | undefined {
   // Read once and copied, so a getter or Proxy cannot answer with other indices
   // than the ones that passed validation.
   const raw: unknown = outcome.indices
   const indices: unknown = Array.isArray(raw) ? [...raw] : undefined
+  const text: unknown = outcome.text
   if (!validIndices(indices, options.length, multiSelect)) return undefined
-  return multiSelect ? multiAnswer(options.map((_, index) => indices.includes(index + 1))) : { kind: 'option', index: indices[0] - 1 }
+  // A `text` this question cannot take is ignored.
+  if (!multiSelect) return { kind: 'option', index: indices[0] - 1 }
+  const typed = typeof text === 'string' ? text.trim() : ''
+  // As on the overlay, nothing checked and no text is not an answer.
+  if (indices.length === 0 && !typed) return undefined
+  return multiAnswer(
+    options.map((_, index) => indices.includes(index + 1)),
+    typed,
+  )
 }
 
 /** Undefined when nobody claims synchronously, so the overlay opens with no async gap. */
@@ -568,7 +589,7 @@ function offerRemoteQuestion(params: QuestionSpec, ctx: ExtensionContext, events
   if (signal?.aborted) return { kind: 'settled', value: null }
 
   const multiSelect = params.multiSelect === true
-  const allowFreeText = !multiSelect && !hasPreviews(params)
+  const allowFreeText = !hasPreviews(params)
   const controller = new AbortController()
   let claimed = false
   let early: { value: QuestionAnswer } | undefined
