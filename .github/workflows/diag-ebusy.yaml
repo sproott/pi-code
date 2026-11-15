@@ -10,12 +10,11 @@ permissions:
 
 jobs:
   kill:
-    runs-on: ${{ matrix.os }}
+    runs-on: windows-latest
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, windows-2022]
-        variant: [taskkill-async, taskkill-sync, pi-code-killProcessTree, pi-bash-abort]
+        variant: [pi-code-killProcessTree, pi-code-killProcessTree-detached, pi-bash-abort]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -25,7 +24,34 @@ jobs:
           node-version: 22.x
           cache: npm
       - run: npm ci --ignore-scripts
-      - run: node scripts/diag-kill.mjs ${{ matrix.variant }}
+      - run: node scripts/diag-kill.mjs ${{ matrix.variant }} sleep tick 'echo;sleep' 'stderr;sleep' 'echo;sleep;echo' 'seq;sleep'
+
+  leftovers:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22.x
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - name: List processes left after each test file
+        shell: pwsh
+        run: |
+          $pattern = 'sleep|tick|seq '
+          foreach ($i in 1..10) {
+            foreach ($t in 'monitor', 'background-bash') {
+              npx vitest run "tests/$t.test.ts" *> "solo-$t-$i.log"
+              $code = $LASTEXITCODE
+              $left = Get-CimInstance Win32_Process | Where-Object { $_.Name -in 'sleep.exe', 'bash.exe', 'seq.exe' -and $_.CommandLine -match $pattern }
+              $parents = @{}; Get-CimInstance Win32_Process | ForEach-Object { $parents[$_.ProcessId] = $_.Name }
+              "LEFT $t run $i exit=$code count=$(@($left).Count)"
+              $left | ForEach-Object { "    $($_.ProcessId) ppid=$($_.ParentProcessId) parent=$($parents[$_.ParentProcessId]) age=$([int]((Get-Date) - $_.CreationDate).TotalSeconds)s $($_.CommandLine)" }
+              $left | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+            }
+          }
 
   repro:
     if: false

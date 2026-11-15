@@ -22,9 +22,9 @@ const sweep = () => {
 
 const shell = getShellConfig()
 const taskkill = path.join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'taskkill.exe')
-const spawnShell = (command) => {
-  // Same options as extensions/monitor.ts execSplit on win32.
-  const child = spawn(shell.shell, [...shell.args, command], { detached: false, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true })
+// detached: false as extensions/monitor.ts execSplit on win32, true as extensions/hooks/runners.ts.
+const spawnShell = (command, detached = false) => {
+  const child = spawn(shell.shell, [...shell.args, command], { detached, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true })
   child.stdout.resume()
   child.stderr.resume()
   return child
@@ -53,6 +53,12 @@ const variants = {
     killProcessTree(child, 'SIGKILL')
     await exited(child)
   },
+  'pi-code-killProcessTree-detached': async (command, delay) => {
+    const child = spawnShell(command, true)
+    await wait(delay)
+    killProcessTree(child, 'SIGKILL')
+    await exited(child)
+  },
   'pi-bash-abort': async (command, delay) => {
     const ac = new AbortController()
     const run = createLocalBashOperations().exec(command, process.cwd(), { onData: () => {}, signal: ac.signal }).catch(() => {})
@@ -67,7 +73,19 @@ if (!variants[variant]) throw new Error(`variant must be one of: ${Object.keys(v
 console.log(`shell: ${shell.shell} ${shell.args.join(' ')}`)
 console.log(execFileSync(shell.shell, ['--version'], { encoding: 'utf8' }).split('\n')[0])
 
-const commands = { sleep: 'sleep 31.7', tick: 'while true; do echo tick; sleep 0.0517; done', bg: 'sleep 31.7 & sleep 31.7', pipe: 'sleep 31.7 | cat' }
+const allCommands = {
+  sleep: 'sleep 31.7',
+  tick: 'while true; do echo tick; sleep 0.0517; done',
+  bg: 'sleep 31.7 & sleep 31.7',
+  pipe: 'sleep 31.7 | cat',
+  // Shapes used in tests/monitor.test.ts and tests/background-bash.test.ts.
+  'echo;sleep': 'echo hi; sleep 31.7',
+  'stderr;sleep': 'printf "%2000s" x >&2; sleep 31.7',
+  'echo;sleep;echo': 'echo started; sleep 31.7; echo late',
+  'seq;sleep': 'seq 1 20000; sleep 31.7',
+}
+const picked = process.argv.slice(3)
+const commands = picked.length ? Object.fromEntries(picked.map((k) => [k, allCommands[k]])) : allCommands
 const trials = 15
 sweep()
 for (const [name, command] of Object.entries(commands)) {
