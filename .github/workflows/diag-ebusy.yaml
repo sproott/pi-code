@@ -1,0 +1,79 @@
+name: Diag EBUSY (temporary)
+
+on:
+  push:
+    branches:
+      - diag-windows-ebusy
+
+permissions:
+  contents: read
+
+jobs:
+  kill:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22.x
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - run: node scripts/diag-kill.mjs
+
+  repro:
+    if: false
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22.x
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - name: Fetch Sysinternals handle
+        shell: pwsh
+        run: |
+          Invoke-WebRequest https://download.sysinternals.com/files/Handle.zip -OutFile "$env:RUNNER_TEMP\Handle.zip"
+          Expand-Archive "$env:RUNNER_TEMP\Handle.zip" -DestinationPath "$env:RUNNER_TEMP\handle"
+          "HANDLE_EXE=$env:RUNNER_TEMP\handle\handle64.exe" >> $env:GITHUB_ENV
+          "EBUSY_DIAG_FILE=$env:RUNNER_TEMP\ebusy-diag.txt" >> $env:GITHUB_ENV
+      - name: Run the suite repeatedly
+        shell: bash
+        run: |
+          fails=0
+          for i in; do
+            echo "::group::run $i"
+            npm test > "run-$i.log" 2>&1 || fails=$((fails+1))
+            grep -E "FAIL|EBUSY" "run-$i.log" | sort -u || true
+            echo "::endgroup::"
+          done
+          echo "suite failures: $fails"
+          f=0
+          for i in $(seq 1 40); do
+            for t in monitor background-bash; do
+              npx vitest run tests/$t.test.ts > "solo-$t-$i.log" 2>&1 || { f=$((f+1)); grep -E "FAIL|EBUSY" "solo-$t-$i.log" | sort -u; }
+            done
+          done
+          echo "solo failures: $f"
+      - name: Diagnostics
+        if: always()
+        shell: bash
+        run: |
+          if [ -f "$EBUSY_DIAG_FILE" ]; then cat "$EBUSY_DIAG_FILE"; echo "::error::EBUSY reproduced"; else echo "no EBUSY"; fi
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: logs-${{ matrix.shard }}
+          path: |
+            run-*.log
+            solo-*.log
+            ${{ runner.temp }}\ebusy-diag.txt
+          if-no-files-found: ignore

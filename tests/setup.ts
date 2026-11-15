@@ -74,9 +74,61 @@ if (process.platform !== 'win32') process.env.TMP = tmpRoot
 // the developer's real ~/.pi/agent whichever home it fakes.
 process.env.PI_CODING_AGENT_DIR = path.join(tmpRoot, 'pi-agent')
 
-afterAll(() => {
-  fs.rmSync(tmpRoot, { recursive: true, force: true })
-})
+afterAll(async () => {
+  try {
+    fs.rmSync(tmpRoot, { recursive: true, force: true })
+  } catch (error) {
+    if (process.platform === 'win32') await diagnoseBusyRoot(error)
+    throw error
+  }
+}, 120_000)
+
+// Temporary diagnostics for the Windows EBUSY on removing tmpRoot.
+async function diagnoseBusyRoot(error: unknown): Promise<void> {
+  const { execFileSync } = await import('node:child_process')
+  const run = (file: string, args: string[]): string => {
+    try {
+      return execFileSync(file, args, { encoding: 'utf8', timeout: 30_000, windowsHide: true })
+    } catch (e) {
+      return `(${file} failed: ${String(e)})`
+    }
+  }
+  const note = (text: string): void => {
+    if (process.env.EBUSY_DIAG_FILE) fs.appendFileSync(process.env.EBUSY_DIAG_FILE, `${text}\n`)
+    console.error(text)
+  }
+  note(`=== EBUSY ${new Date().toISOString()} pid=${process.pid} root=${tmpRoot}\nerror: ${String(error)}`)
+  const left: string[] = []
+  const walk = (dir: string): void => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name)
+      left.push(full + (entry.isDirectory() ? '\\' : ''))
+      if (entry.isDirectory()) walk(full)
+    }
+  }
+  try {
+    walk(tmpRoot)
+  } catch (e) {
+    left.push(`(walk failed: ${String(e)})`)
+  }
+  note(['--- left in root:', ...left].join('\n'))
+  const handles = process.env.HANDLE_EXE ? run(process.env.HANDLE_EXE, ['-accepteula', '-nobanner', '-u', tmpRoot]) : '(no HANDLE_EXE)'
+  note(`--- handle:\n${handles}`)
+  const procs = run('powershell', [
+    '-NoProfile',
+    '-Command',
+    "Get-CimInstance Win32_Process | Where-Object { $_.Name -notmatch '^(svchost|System|Idle|Registry|smss|csrss|wininit|services|lsass|winlogon|dwm|fontdrvhost|WmiPrvSE|conhost|RuntimeBroker|sihost|taskhostw|explorer|ctfmon|MsMpEng|NisSrv|SearchIndexer|spoolsv|dllhost|Runner.Listener|Runner.Worker|provisioner)' } | Format-Table -AutoSize -Wrap ProcessId,ParentProcessId,Name,CreationDate,CommandLine | Out-String -Width 400",
+  ])
+  note(`--- processes:\n${procs}`)
+  await new Promise((resolve) => setTimeout(resolve, 3000))
+  let later = 'removed after 3 s'
+  try {
+    fs.rmSync(tmpRoot, { recursive: true, force: true })
+  } catch (e) {
+    later = `still failing after 3 s: ${String(e)}`
+  }
+  note(`retry: ${later}\n`)
+}
 
 let snapshot: NodeJS.ProcessEnv
 
