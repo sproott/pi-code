@@ -87,6 +87,7 @@ const setup = (): Harness => {
 
   todoExtension({
     appendEntry: () => {},
+    getSettings: () => ({}),
     on: (name: string, fn: Handler) => handlers.set(name, fn),
     registerCommand: (name: string, config: CommandConfig) => commands.set(name, config),
     registerTool: (t: Record<string, unknown>) => {

@@ -17,11 +17,13 @@
  * and session_compact, so the list survives compaction without external files.
  */
 
-import type { ExtensionAPI, ExtensionContext, ExtensionUIContext, SessionEntry, Theme } from '@earendil-works/pi-coding-agent'
-import { matchesKey, Text, type TUI, truncateToWidth } from '@earendil-works/pi-tui'
+import { defineTool, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext, type ExtensionUIContext, getAgentDir, getSettingsListTheme, type SessionEntry, SettingsManager, type Theme, type ToolDefinition } from '@earendil-works/pi-coding-agent'
+import { matchesKey, type SettingItem, SettingsList, Text, type TUI, truncateToWidth } from '@earendil-works/pi-tui'
 import { type Static, Type } from 'typebox'
 
+import { updatePiCodeSettings } from './internal/pi-settings.ts'
 import { stringEnum } from './internal/string-enum.ts'
+import { errorMessage } from './internal/values.ts'
 
 type TodoStatus = 'pending' | 'in_progress' | 'completed'
 type TodoAction = 'add' | 'start' | 'complete' | 'delete' | 'clear' | 'list'
@@ -75,6 +77,40 @@ type WidgetMode = (typeof WIDGET_MODES)[number]
 // Content budget: heading + todo rows + optional "+N more" summary. The
 // rendered widget is one line taller (trailing spacer below the panel).
 const MAX_WIDGET_LINES = 12
+
+type TodoGuidance = 'light' | 'strong'
+type GuidanceText = Pick<ToolDefinition, 'description' | 'promptSnippet' | 'promptGuidelines'>
+
+const TOOL_MECHANICS = 'Actions: add (text, optional activeForm), start (id, mark in_progress), complete (id), delete (id), clear, list. Status machine: pending -> in_progress -> completed. Exactly one todo is in_progress at a time; start moves any other in_progress todo back to pending.'
+
+/** How strongly the prompt pushes the model to keep a todo list, chosen by `piCode.todoGuidance`. */
+const TODO_GUIDANCE: Record<TodoGuidance, GuidanceText> = {
+  light: {
+    description: `A todo list for tracking the steps of a task and their progress. ${TOOL_MECHANICS} While a list is in use, start a todo before working on it and complete it once it is done.`,
+    promptSnippet: 'Keep a todo list of task steps and their status',
+    promptGuidelines: [],
+  },
+  strong: {
+    description: `Manage a todo list for tracking multi-step progress. ${TOOL_MECHANICS}`,
+    promptSnippet: 'Manage a todo list to plan and track multi-step work',
+    promptGuidelines: [
+      'Use the todo tool to create todos for any multi-step work (3+ steps) or when the user gives you a list of tasks. Skip it for single trivial tasks and purely conversational requests.',
+      "Keep exactly one todo in_progress at a time: mark a todo in_progress (todo action start) BEFORE beginning work on it, passing activeForm as a present-continuous label (e.g. 'Writing tests').",
+      'Mark a todo completed (todo action complete) IMMEDIATELY after finishing it; never batch completions or leave finished work in_progress.',
+    ],
+  },
+}
+
+const configuredLevel = (settings: unknown): TodoGuidance | undefined => {
+  const value = (settings as { piCode?: { todoGuidance?: unknown } } | undefined)?.piCode?.todoGuidance
+  return typeof value === 'string' && Object.hasOwn(TODO_GUIDANCE, value) ? (value as TodoGuidance) : undefined
+}
+const guidanceLevel = (settings: unknown): TodoGuidance => configuredLevel(settings) ?? 'light'
+const GUIDANCE_ROW = 'todoGuidance'
+const GUIDANCE_HELP = 'light: the model decides when a todo list is worth keeping. strong: it is told to keep one for any work of 3+ steps.'
+
+const REMINDER_AFTER_TURNS = 10
+const TODO_REMINDER = 'Automatic reminder, not written by the user: the todo tool has not been used for several turns. If the current work has steps worth tracking, a todo list may help; if an existing list no longer matches the work, update or clear it. Ignore this if it does not apply.'
 
 export const normalizeTodo = (raw: LegacyTodo): Todo => {
   if (raw.status) return { id: raw.id, text: raw.text, status: raw.status, activeForm: raw.activeForm }
@@ -393,7 +429,14 @@ export default function todoExtension(pi: ExtensionAPI) {
     overlay.update()
   }
 
+  let turnsWithoutTodo = 0
+  // pi's settings snapshot keeps the old value until /reload, so a level saved by /todos settings is held here.
+  let savedLevel: TodoGuidance | undefined
+  const currentLevel = () => savedLevel ?? guidanceLevel(pi.getSettings())
+
   pi.on('session_start', (_event, ctx) => {
+    registerTodo(currentLevel())
+    turnsWithoutTodo = 0
     reconstructState(ctx)
     if (ctx.hasUI) overlay.setUICtx(ctx.ui)
     overlay.update()
@@ -405,8 +448,19 @@ export default function todoExtension(pi: ExtensionAPI) {
   // Reads live state at render time; never replay the branch here (the
   // branch is stale until message_end runs after tool_execution_end).
   pi.on('tool_execution_end', (event) => {
-    if (event.toolName !== TOOL_NAME || event.isError) return
-    overlay.update()
+    if (event.toolName !== TOOL_NAME) return
+    turnsWithoutTodo = 0
+    if (!event.isError) overlay.update()
+  })
+
+  pi.on('turn_end', () => {
+    turnsWithoutTodo++
+  })
+  // Added to a single request only, so the reminder never enters the session.
+  pi.on('context', (event) => {
+    if (turnsWithoutTodo < REMINDER_AFTER_TURNS || !pi.getActiveTools().includes(TOOL_NAME)) return
+    turnsWithoutTodo = 0
+    return { messages: [...event.messages, { role: 'user' as const, content: TODO_REMINDER, timestamp: Date.now() }] }
   })
 
   const toolMessage = (text: string, details: TodoDetails) => ({
@@ -472,18 +526,10 @@ export default function todoExtension(pi: ExtensionAPI) {
 
   const handleList = () => ok('list', plainTodoList(todos))
 
-  // Register the todo tool for the LLM
-  pi.registerTool({
+  const todoTool = defineTool({
     name: TOOL_NAME,
     label: 'Todo',
-    description:
-      'Manage a todo list for tracking multi-step progress. Actions: add (text, optional activeForm), start (id, mark in_progress), complete (id), delete (id), clear, list. Status machine: pending -> in_progress -> completed. Exactly one todo is in_progress at a time; start moves any other in_progress todo back to pending.',
-    promptSnippet: 'Manage a todo list to plan and track multi-step work',
-    promptGuidelines: [
-      'Use the todo tool to create todos for any multi-step work (3+ steps) or when the user gives you a list of tasks. Skip it for single trivial tasks and purely conversational requests.',
-      "Keep exactly one todo in_progress at a time: mark a todo in_progress (todo action start) BEFORE beginning work on it, passing activeForm as a present-continuous label (e.g. 'Writing tests').",
-      'Mark a todo completed (todo action complete) IMMEDIATELY after finishing it; never batch completions or leave finished work in_progress.',
-    ],
+    ...TODO_GUIDANCE.light,
     parameters: TodoParams,
 
     async execute(_toolCallId, params, _signal, _onUpdate, _ctx) /* NOSONAR typescript:S7503 - pi types a tool execute as returning a Promise */ {
@@ -543,6 +589,10 @@ export default function todoExtension(pi: ExtensionAPI) {
       return new Text(glyph + theme.fg('muted', msg), 0, 0)
     },
   })
+  // pi re-describes a tool only when it is registered again, and settings are readable
+  // only once the session is bound: register with the default now, the setting's level at session_start.
+  const registerTodo = (level: TodoGuidance) => pi.registerTool({ ...todoTool, ...TODO_GUIDANCE[level] })
+  registerTodo('light')
 
   pi.registerCommand('todos-widget', {
     description: 'Set the todo widget display: off, compact, or full (default)',
@@ -578,9 +628,56 @@ export default function todoExtension(pi: ExtensionAPI) {
   })
 
   // Register the /todos command for users
+  const saveLevel = (ctx: ExtensionCommandContext, level: TodoGuidance): boolean => {
+    try {
+      updatePiCodeSettings((piCode) => ({ ...piCode, todoGuidance: level }))
+    } catch (error) {
+      ctx.ui.notify(`Could not update pi settings: ${errorMessage(error)}`, 'error')
+      return false
+    }
+    savedLevel = level
+    registerTodo(level)
+    return true
+  }
+
+  const showSettings = async (ctx: ExtensionCommandContext) => {
+    const projectLevel = ctx.isProjectTrusted() ? configuredLevel(SettingsManager.create(ctx.cwd, getAgentDir(), { projectTrusted: true }).getProjectSettings()) : undefined
+    const item: SettingItem = projectLevel
+      ? { id: GUIDANCE_ROW, label: 'Todo guidance', currentValue: projectLevel, description: `${GUIDANCE_HELP} Set by this project's .pi/settings.json; change it there.` }
+      : { id: GUIDANCE_ROW, label: 'Todo guidance', currentValue: currentLevel(), values: Object.keys(TODO_GUIDANCE), description: `${GUIDANCE_HELP} Saved to pi's settings.json.` }
+    if (ctx.mode !== 'tui') {
+      ctx.ui.notify(`Todo guidance: ${item.currentValue}. ${item.description}`, 'info')
+      return
+    }
+    await ctx.ui.custom<void>((tui, _theme, _kb, done) => {
+      const list = new SettingsList(
+        [item],
+        1,
+        getSettingsListTheme(),
+        (_id, value) => {
+          if (!saveLevel(ctx, value as TodoGuidance)) list.updateValue(GUIDANCE_ROW, currentLevel())
+        },
+        () => done(),
+      )
+      return {
+        render: (width: number) => list.render(width),
+        invalidate: () => list.invalidate(),
+        handleInput: (data: string) => {
+          list.handleInput(data)
+          tui.requestRender()
+        },
+      }
+    })
+  }
+
   pi.registerCommand('todos', {
-    description: 'Show all todos on the current branch',
-    handler: async (_args, ctx) => {
+    description: 'Show all todos on the current branch (/todos settings to choose how hard the prompt pushes the list)',
+    getArgumentCompletions: (argumentPrefix) => ('settings'.startsWith(argumentPrefix.trim()) ? [{ value: 'settings', label: 'settings' }] : null),
+    handler: async (args, ctx) => {
+      if (args.trim() === 'settings') {
+        await showSettings(ctx)
+        return
+      }
       if (!ctx.hasUI) {
         ctx.ui.notify('/todos requires interactive mode', 'error')
         return
