@@ -9,8 +9,8 @@
 
 import { randomUUID } from 'node:crypto'
 import * as os from 'node:os'
-import type { ExtensionAPI, ExtensionContext, Theme } from '@earendil-works/pi-coding-agent'
-import { CURSOR_MARKER, Editor, Key, matchesKey, renderFakeCursor, Text, truncateToWidth, visibleWidth, wrapTextWithAnsi } from '@earendil-works/pi-tui'
+import { type ExtensionAPI, type ExtensionContext, getMarkdownTheme, type Theme } from '@earendil-works/pi-coding-agent'
+import { CURSOR_MARKER, Editor, Key, Markdown, matchesKey, renderFakeCursor, Text, truncateToWidth, visibleWidth, wrapTextWithAnsi } from '@earendil-works/pi-tui'
 import { Type } from 'typebox'
 import { editTextExternally, externalEditorCommand } from './internal/external-editor.ts'
 import { readManagedSettings } from './internal/managed-settings.ts'
@@ -19,6 +19,7 @@ import { readUserSetting } from './internal/settings-chain.ts'
 interface OptionWithDesc {
   label: string
   description?: string
+  preview?: string
 }
 
 interface QuestionDetails {
@@ -34,6 +35,7 @@ interface QuestionDetails {
   timedOut?: boolean
   /** The user chose "Chat about this" to clarify the questions. */
   chat?: boolean
+  notes?: string
 }
 
 type QuestionResult = { content: Array<{ type: 'text'; text: string }>; details: QuestionDetails }
@@ -42,6 +44,7 @@ type QuestionResult = { content: Array<{ type: 'text'; text: string }>; details:
 const OptionSchema = Type.Object({
   label: Type.String({ description: 'Display label for the option' }),
   description: Type.Optional(Type.String({ description: 'Optional description shown below label' })),
+  preview: Type.Optional(Type.String({ description: 'Optional Markdown shown beside the options while this option is focused, such as a code snippet or layout mockup; single-select questions only' })),
 })
 
 const SingleQuestion = Type.Object({
@@ -152,11 +155,19 @@ function optionLine(label: string, index: number, selected: boolean, theme: Them
 /** One row of a question; the cursor indexes into the question's rows. */
 type Row = { kind: 'option'; index: number; option: OptionWithDesc } | { kind: 'text' } | { kind: 'chat' }
 
-function questionRows(spec: QuestionSpec): Row[] {
-  return [...spec.options.map((option, index): Row => ({ kind: 'option', index, option })), { kind: 'text' }, { kind: 'chat' }]
+/** A single-select question with any `preview`, blank included, shows the preview layout; multiSelect ignores previews. */
+function hasPreviews(spec: QuestionSpec): boolean {
+  return spec.multiSelect !== true && spec.options.some((option) => typeof option.preview === 'string')
 }
 
-type SingleAnswer = { kind: 'option'; index: number } | { kind: 'text'; text: string }
+/** The preview layout has notes in place of the free-text row. */
+function questionRows(spec: QuestionSpec): Row[] {
+  const options = spec.options.map((option, index): Row => ({ kind: 'option', index, option }))
+  return hasPreviews(spec) ? [...options, { kind: 'chat' }] : [...options, { kind: 'text' }, { kind: 'chat' }]
+}
+
+/** `notes` is an answer made of the question's notes alone, with no option chosen. */
+type SingleAnswer = { kind: 'option'; index: number } | { kind: 'text'; text: string } | { kind: 'notes' }
 /** The checked option indices in option order, plus the free-text row when it has text. */
 type MultiAnswer = { kind: 'multi'; indices: number[]; text?: string }
 type Answer = SingleAnswer | MultiAnswer
@@ -164,11 +175,12 @@ type Answer = SingleAnswer | MultiAnswer
 type TimedOut = { kind: 'timedOut'; selected?: MultiAnswer }
 type Outcome = Answer | TimedOut
 
-/** What the form ends with; `undefined` in `answers` is an unanswered question. A cancel is null. */
-type FormResult = { kind: 'submit'; answers: Array<Answer | undefined> } | { kind: 'timeout'; answers: Outcome[] } | { kind: 'chat'; answers: Array<Answer | undefined> }
+/** What the form ends with; `undefined` in `answers` is an unanswered question. A cancel is null.
+ * `notes` holds each question's trimmed notes, sent only with an answer. */
+type FormResult = ({ kind: 'submit'; answers: Array<Answer | undefined> } | { kind: 'timeout'; answers: Outcome[] } | { kind: 'chat'; answers: Array<Answer | undefined> }) & { notes?: string[] }
 
-/** A question is answered exactly when `confirmed` is set. */
-type QuestionState = { rows: Row[]; cursor: number; typing: boolean; draft: Editor } & ({ mode: 'single'; confirmed?: SingleAnswer } | { mode: 'multi'; checked: boolean[]; confirmed?: MultiAnswer })
+/** A question is answered exactly when `confirmed` is set. `notes` is used only in the preview layout. */
+type QuestionState = { rows: Row[]; cursor: number; typing: boolean; draft: Editor; notes: Editor; notesOpen: boolean } & ({ mode: 'single'; confirmed?: SingleAnswer } | { mode: 'multi'; checked: boolean[]; confirmed?: MultiAnswer })
 
 /** Text still being typed counts once typing stops, so a remote answer never submits a half-typed draft. */
 function settledText(state: QuestionState): string {
@@ -212,11 +224,21 @@ function answerText(spec: QuestionSpec, answer: Answer): string {
       return spec.options[answer.index].label
     case 'text':
       return answer.text
+    case 'notes':
+      return '(notes only)'
     case 'multi':
       return [...answer.indices.map((index) => spec.options[index].label), ...(answer.text ? [answer.text] : [])].join(', ')
     default:
       return unreachable(answer)
   }
+}
+
+/** The preview layout's parts: each option's rendered preview, the terminal height, and the notes field at a given width. */
+interface PreviewView {
+  markdown: Array<Markdown | undefined>
+  widest: number
+  rows: number
+  notes: (room: number) => string[]
 }
 
 interface QuestionView {
@@ -226,6 +248,65 @@ interface QuestionView {
   state: QuestionState
   field: string[]
   theme: Theme
+  preview?: PreviewView
+}
+
+const PREVIEW_COLUMN = 34
+const PREVIEW_MIN_BOX = 44
+/** Narrower than this, the box goes below the options. */
+const PREVIEW_MIN_ROOM = 20
+/** Terminal rows kept for everything around the preview box. */
+const PREVIEW_RESERVED_ROWS = 26
+const NOTES_LABEL = 'Notes: '
+
+/** The widest line of any preview of the question, for the box width all its options share. */
+function widestPreview(spec: QuestionSpec): number {
+  return Math.max(0, ...spec.options.flatMap((option) => (option.preview ?? '').split('\n').map((line) => visibleWidth(line))))
+}
+
+/** The bordered box around one preview, cut to `maxLines` lines with a count of the rest. */
+function previewBox(markdown: Markdown | undefined, width: number, maxLines: number, theme: Theme): string[] {
+  const inner = Math.max(1, width - 4)
+  const body = markdown?.render(inner) ?? ['No preview available']
+  const shown = body.slice(0, maxLines)
+  const border = (text: string) => theme.fg('dim', text)
+  const lines = [border(`┌${'─'.repeat(width - 2)}┐`)]
+  for (const line of shown) {
+    const cut = truncateToWidth(line, inner)
+    lines.push(`${border('│ ')}${cut}${' '.repeat(Math.max(0, inner - visibleWidth(cut)))}${border(' │')}`)
+  }
+  if (body.length > shown.length) {
+    const marker = `├─── ✂ ─── ${body.length - shown.length} lines hidden `
+    lines.push(theme.fg('warning', `${truncateToWidth(marker + '─'.repeat(width), width - 1)}┤`))
+  }
+  lines.push(border(`└${'─'.repeat(width - 2)}┘`))
+  return lines
+}
+
+/** The options beside the focused option's preview, then the notes under the box. The
+ * Chat row keeps the last option's preview and pointer. */
+function previewRows(view: QuestionView, preview: PreviewView): string[] {
+  const { width, state, theme } = view
+  const options = state.rows.filter((row) => row.kind === 'option')
+  const focus = Math.min(state.cursor, options.length - 1)
+  const stacked = width - PREVIEW_COLUMN < PREVIEW_MIN_ROOM
+  const column = stacked ? width : PREVIEW_COLUMN
+  const left = options.flatMap((row) => {
+    const selected = row.index === focus
+    const answered = state.confirmed?.kind === 'option' && state.confirmed.index === row.index
+    const parts = wrapTextWithAnsi(row.option.label, Math.max(1, column - 6))
+    return parts.map((part, n) => {
+      const line = n === 0 ? optionLine(part, row.index, selected, theme) : `    ${theme.fg(selected ? 'accent' : 'text', part)}`
+      return n === parts.length - 1 && answered ? line + theme.fg('success', ' ✔') : line
+    })
+  })
+  const boxWidth = stacked ? width : Math.min(width - PREVIEW_COLUMN, Math.max(PREVIEW_MIN_BOX, preview.widest + 4))
+  const box = previewBox(preview.markdown[focus], boxWidth, Math.max(1, preview.rows - PREVIEW_RESERVED_ROWS), theme)
+  const indent = stacked ? 0 : PREVIEW_COLUMN
+  const body = stacked ? [...left, '', ...box] : Array.from({ length: Math.max(left.length, box.length) }, (_, i) => truncateToWidth(left[i] ?? '', column, '', true) + (box[i] ?? ''))
+  const [first = '', ...rest] = preview.notes(Math.max(1, width - indent - NOTES_LABEL.length))
+  const pad = ' '.repeat(indent)
+  return [...body, '', `${pad}${theme.fg('accent', 'Notes:')} ${first}`, ...rest.map((line) => pad + ' '.repeat(NOTES_LABEL.length) + line)]
 }
 
 /** The top border, question and rows; the caller adds the tab bar and footer. */
@@ -246,6 +327,12 @@ function buildQuestionLines(view: QuestionView): string[] {
   }
   wrapIndented(question, 1, 'text')
   lines.push('')
+  if (view.preview) {
+    lines.push(...previewRows(view, view.preview), theme.fg('dim', '─'.repeat(width)))
+    const selected = state.rows[state.cursor].kind === 'chat'
+    lines.push((selected ? theme.fg('accent', '❯ ') : '  ') + theme.fg(selected ? 'accent' : 'text', 'Chat about this'))
+    return lines.map((line) => truncateToWidth(line, width))
+  }
 
   state.rows.forEach((row, i) => {
     for (const line of rowLines(view, row, i)) add(line)
@@ -293,6 +380,11 @@ function navHint(multiSelect: boolean, tabs: boolean, typing: boolean): string {
   return multiSelect ? ` Space to toggle · ${move} · Enter to confirm · Esc to cancel` : ` Enter to select · ${move} · Esc to cancel`
 }
 
+/** Longer than 80 columns with tabs, so the form wraps it. */
+function previewHint(tabs: boolean, notesOpen: boolean): string {
+  return ` Enter to select · ↑/↓ to navigate · n to add notes${tabs ? ' · Tab to switch questions' : ''}${notesOpen ? ' · Ctrl+G to edit' : ''} · Esc to cancel`
+}
+
 /** The first and last tab that fit in `room` columns, one column apart, grown
  * outward from the active tab so it always stays visible. */
 function tabWindow(widths: number[], active: number, room: number): [number, number] {
@@ -324,6 +416,7 @@ function renderAnswered(details: QuestionDetails, answer: string, theme: Theme):
   if (details.wasCustom) {
     return theme.fg('success', '✓ ') + theme.fg('muted', '(wrote) ') + theme.fg('accent', answer)
   }
+  if (!answer && details.notes) return theme.fg('success', '✓ ') + theme.fg('muted', '(notes only)')
   if (details.multiSelect) {
     return theme.fg('success', '✓ ') + theme.fg('accent', answer || '(none)')
   }
@@ -453,12 +546,12 @@ function validIndices(indices: unknown, count: number, multiSelect: boolean): in
 
 /** A remote outcome as the answer it stands for: null is a cancel, undefined is a
  * pass or anything this question cannot accept, which must never become an answer. */
-function remoteAnswer(outcome: RemoteQuestionOutcome, options: OptionWithDesc[], multiSelect: boolean): QuestionAnswer | undefined {
+function remoteAnswer(outcome: RemoteQuestionOutcome, options: OptionWithDesc[], multiSelect: boolean, allowFreeText: boolean): QuestionAnswer | undefined {
   if (outcome === null || typeof outcome !== 'object') return undefined
   if (outcome.action === 'cancel') return null
   if (outcome.action === 'text') {
     const text = typeof outcome.text === 'string' ? outcome.text.trim() : ''
-    return !multiSelect && text ? { kind: 'text', text } : undefined
+    return allowFreeText && text ? { kind: 'text', text } : undefined
   }
   if (outcome.action !== 'answer') return undefined
   // Read once and copied, so a getter or Proxy cannot answer with other indices
@@ -475,6 +568,7 @@ function offerRemoteQuestion(params: QuestionSpec, ctx: ExtensionContext, events
   if (signal?.aborted) return { kind: 'settled', value: null }
 
   const multiSelect = params.multiSelect === true
+  const allowFreeText = !multiSelect && !hasPreviews(params)
   const controller = new AbortController()
   let claimed = false
   let early: { value: QuestionAnswer } | undefined
@@ -497,9 +591,9 @@ function offerRemoteQuestion(params: QuestionSpec, ctx: ExtensionContext, events
     sessionId: ctx.sessionManager.getSessionId(),
     question: params.question,
     header: params.header,
-    options: params.options.map(({ label, description }) => ({ label, ...(description === undefined ? {} : { description }) })),
+    options: params.options.map(({ label, description, preview }) => ({ label, ...(description === undefined ? {} : { description }), ...(preview === undefined ? {} : { preview }) })),
     multiSelect,
-    allowFreeText: !multiSelect,
+    allowFreeText,
     ...(batch ? { batch } : {}),
     signal: controller.signal,
     claim: () => {
@@ -507,7 +601,7 @@ function offerRemoteQuestion(params: QuestionSpec, ctx: ExtensionContext, events
       claimed = true
       return (outcome) => {
         if (controller.signal.aborted) return false
-        const value = remoteAnswer(outcome, params.options, multiSelect)
+        const value = remoteAnswer(outcome, params.options, multiSelect, allowFreeText)
         if (value !== undefined) {
           settle(value)
           return true
@@ -585,16 +679,16 @@ function overlayResult(specs: QuestionSpec[], result: FormResult | null | undefi
   const lone = specs.length === 1
   switch (result.kind) {
     case 'chat':
-      return chatResult(specs, result.answers)
+      return chatResult(specs, result.answers, result.notes)
     case 'submit':
       return combine(
         specs,
-        specs.map((spec, index) => answerToResult(spec, result.answers[index])),
+        specs.map((spec, index) => answerToResult(spec, result.answers[index], true, result.notes?.[index])),
       )
     case 'timeout': {
       const combined = combine(
         specs,
-        specs.map((spec, index) => answerToResult(spec, result.answers[index], lone)),
+        specs.map((spec, index) => answerToResult(spec, result.answers[index], lone, result.notes?.[index])),
       )
       if (lone) return combined
       // Claude tells the model the user may be away on every timeout, even a fully answered one.
@@ -606,11 +700,12 @@ function overlayResult(specs: QuestionSpec[], result: FormResult | null | undefi
 }
 
 /** Claude Code's clarify text for "Chat about this", followed by each question and the answer Submit would send. */
-function chatResult(specs: QuestionSpec[], answers: Array<Answer | undefined>): QuestionResult {
+function chatResult(specs: QuestionSpec[], answers: Array<Answer | undefined>, notes: string[] = []): QuestionResult {
   const asked = specs.map((spec, index) => {
     const answer = answers[index]
     const given = answer ? `Answer: ${answerText(spec, answer)}` : '(No answer provided)'
-    return `- "${spec.question}"\n  ${given}`
+    const noted = notes[index] ? `\n  User notes: ${notes[index]}` : ''
+    return `- "${spec.question}"\n  ${given}${noted}`
   })
   const text = `The user wants to clarify these questions.
     This means they may have additional information, context or questions for you.
@@ -634,8 +729,28 @@ function multiResultText(spec: QuestionSpec, answer: MultiAnswer): string {
 }
 
 /** `outcome` undefined is a skipped question and null a cancel. `awayNotice` false
- * leaves the timeout notice to the caller, which sends it once per call. */
-function answerToResult(spec: QuestionSpec, outcome: Outcome | null | undefined, awayNotice = true): QuestionResult {
+ * leaves the timeout notice to the caller, which sends it once per call. `notes` go
+ * only with an answer: a skipped, cancelled or unconfirmed question drops them. */
+function answerToResult(spec: QuestionSpec, outcome: Outcome | null | undefined, awayNotice = true, notes = ''): QuestionResult {
+  const result = outcomeResult(spec, outcome, awayNotice)
+  if (!notes || !outcome || outcome.kind === 'timedOut') return result
+  return { content: [{ type: 'text', text: `${result.content[0].text}\nUser notes: ${notes}` }], details: { ...result.details, notes } }
+}
+
+function timedOutText(spec: QuestionSpec, outcome: TimedOut, awayNotice: boolean): string {
+  const labels = outcome.selected ? answerText(spec, { kind: 'multi', indices: outcome.selected.indices }) : ''
+  const typed = outcome.selected?.text
+  const already = (labels ? ` Already selected: ${labels}.` : '') + (typed ? ` Already typed: ${typed}.` : '')
+  return awayNotice ? `${AWAY_NOTICE}${already} ${PROCEED_NOTICE}` : `No response.${already}`
+}
+
+/** The chosen option, then its preview when it has one. */
+function selectedText(spec: QuestionSpec, index: number): string {
+  const { label, preview } = spec.options[index]
+  return `User selected: ${index + 1}. ${label}${preview?.trim() ? `\nSelected preview:\n${preview}` : ''}`
+}
+
+function outcomeResult(spec: QuestionSpec, outcome: Outcome | null | undefined, awayNotice: boolean): QuestionResult {
   const multiSelect = spec.multiSelect === true
   const base = { question: spec.question, options: spec.options.map((o) => o.label), ...(spec.header ? { header: spec.header } : {}), ...(multiSelect ? { multiSelect: true } : {}) }
 
@@ -647,26 +762,21 @@ function answerToResult(spec: QuestionSpec, outcome: Outcome | null | undefined,
   }
 
   switch (outcome.kind) {
-    case 'timedOut': {
+    case 'timedOut':
       // Claude: "tells Claude you may be away from your keyboard, so Claude proceeds
       // on its own judgment and can re-ask later." Not framed as a cancel: `answer` is
       // '' rather than null, so renderResult and a batch's own null-check both read it
       // as "answered nothing, but not declined" rather than the user having said no.
-      const selected = outcome.selected ? answerText(spec, outcome.selected) : ''
-      const labels = outcome.selected ? answerText(spec, { kind: 'multi', indices: outcome.selected.indices }) : ''
-      const typed = outcome.selected?.text
-      const already = (labels ? ` Already selected: ${labels}.` : '') + (typed ? ` Already typed: ${typed}.` : '')
       return {
-        content: [{ type: 'text', text: awayNotice ? `${AWAY_NOTICE}${already} ${PROCEED_NOTICE}` : `No response.${already}` }],
-        details: { ...base, answer: selected, timedOut: true },
+        content: [{ type: 'text', text: timedOutText(spec, outcome, awayNotice) }],
+        details: { ...base, answer: outcome.selected ? answerText(spec, outcome.selected) : '', timedOut: true },
       }
-    }
     case 'text':
       return { content: [{ type: 'text', text: `User wrote: ${outcome.text}` }], details: { ...base, answer: outcome.text, wasCustom: true } }
-    case 'option': {
-      const label = spec.options[outcome.index].label
-      return { content: [{ type: 'text', text: `User selected: ${outcome.index + 1}. ${label}` }], details: { ...base, answer: label, wasCustom: false } }
-    }
+    case 'option':
+      return { content: [{ type: 'text', text: selectedText(spec, outcome.index) }], details: { ...base, answer: spec.options[outcome.index].label, wasCustom: false } }
+    case 'notes':
+      return { content: [{ type: 'text', text: 'User selected: (no option selected)' }], details: { ...base, answer: '', wasCustom: false } }
     case 'multi':
       return { content: [{ type: 'text', text: multiResultText(spec, outcome) }], details: { ...base, answer: answerText(spec, outcome), wasCustom: false } }
     default:
@@ -721,9 +831,11 @@ export async function askViaOverlay(specs: QuestionSpec[], ctx: ExtensionContext
       }
       let editing = false
       const states = specs.map((spec): QuestionState => {
-        const common = { rows: questionRows(spec), cursor: 0, typing: false, draft: new Editor(tui, editorTheme) }
+        const common = { rows: questionRows(spec), cursor: 0, typing: false, draft: new Editor(tui, editorTheme), notes: new Editor(tui, editorTheme), notesOpen: false }
         return spec.multiSelect ? { ...common, mode: 'multi', checked: spec.options.map(() => false) } : { ...common, mode: 'single' }
       })
+      const markdownTheme = getMarkdownTheme()
+      const previews = specs.map((spec): PreviewView['markdown'] | undefined => (hasPreviews(spec) ? spec.options.map((option) => (option.preview?.trim() ? new Markdown(option.preview, 0, 0, markdownTheme) : undefined)) : undefined))
       saved.forEach((value, index) => {
         if (value) restoreRemoteAnswer(index, value)
       })
@@ -749,13 +861,14 @@ export async function askViaOverlay(specs: QuestionSpec[], ctx: ExtensionContext
       function finish(value: FormResult | null): void {
         if (finished) return
         dispose()
-        done(value)
+        done(value && { ...value, notes: states.map((state) => state.notes.getText().trim()) })
       }
       function abort(): void {
         finish(null)
       }
-      /** A confirmed multi-select with nothing left checked and no text is unanswered. */
+      /** A confirmed multi-select with nothing left checked and no text is unanswered, as are notes since emptied. */
       function confirmedAnswer(state: QuestionState): Answer | undefined {
+        if (state.confirmed?.kind === 'notes' && !state.notes.getText().trim()) return undefined
         return state.mode === 'multi' && !state.checked.some(Boolean) && !state.confirmed?.text ? undefined : state.confirmed
       }
       /** The confirmed answer, else what a multiSelect has filled in. As in Claude Code, single-select
@@ -788,6 +901,8 @@ export async function askViaOverlay(specs: QuestionSpec[], ctx: ExtensionContext
             state.draft.setText(value.text)
             return
           case 'option':
+            return
+          case 'notes':
             return
           default:
             unreachable(value)
@@ -880,12 +995,12 @@ export async function askViaOverlay(specs: QuestionSpec[], ctx: ExtensionContext
         refresh()
         return true
       }
-      async function editExternally(state: QuestionState): Promise<void> {
+      async function editExternally(state: QuestionState, editor: Editor): Promise<void> {
         editing = true
         try {
-          const text = await editTextExternally(tui, externalEditorCommand(ctx.cwd), state.draft.getText())
+          const text = await editTextExternally(tui, externalEditorCommand(ctx.cwd), editor.getText())
           if (text === undefined || finished) return
-          state.draft.setText(text)
+          editor.setText(text)
           followEdits(state)
         } finally {
           editing = false
@@ -897,7 +1012,7 @@ export async function askViaOverlay(specs: QuestionSpec[], ctx: ExtensionContext
         else confirmSelection(state)
       }
       function handleTypingInput(state: QuestionState, data: string): void {
-        if (keybindings.matches(data, 'app.editor.external')) void editExternally(state)
+        if (keybindings.matches(data, 'app.editor.external')) void editExternally(state, state.draft)
         else if (matchesKey(data, Key.escape)) finish(null)
         // Ctrl+J, one of pi's newline keys, also reads as Enter.
         else if (matchesKey(data, Key.enter) && !keybindings.matches(data, 'tui.input.newLine')) confirmTyped(state)
@@ -906,16 +1021,39 @@ export async function askViaOverlay(specs: QuestionSpec[], ctx: ExtensionContext
           followEdits(state)
         }
       }
-      function handleQuestionInput(state: QuestionState, data: string): void {
-        if (moveFocus(state, data)) return
+      /** Enter with notes confirms the question, keeping a chosen option; empty notes only close. */
+      function confirmNotes(state: QuestionState): void {
+        state.notesOpen = false
+        if (state.notes.getText().trim()) commit(confirmedAnswer(state) ?? { kind: 'notes' })
+      }
+      /** Open notes take every key but Esc, which closes them and keeps the text. */
+      function handleNotesInput(state: QuestionState, data: string): void {
+        if (keybindings.matches(data, 'app.editor.external')) void editExternally(state, state.notes)
+        else if (matchesKey(data, Key.escape)) state.notesOpen = false
+        else if (matchesKey(data, Key.enter) && !keybindings.matches(data, 'tui.input.newLine')) confirmNotes(state)
+        else if (!matchesKey(data, Key.tab) && !matchesKey(data, Key.shift('tab'))) state.notes.handleInput(data)
+      }
+      /** `n` opens the notes from an option row; a digit moves the focus to that option. */
+      function handlePreviewKey(state: QuestionState, data: string): void {
+        const digit = Number(data)
+        if (data === 'n' && state.rows[state.cursor].kind === 'option') state.notesOpen = true
+        else if (/^[1-9]$/.test(data) && digit <= state.rows.length - 1) state.cursor = digit - 1
+      }
+      function handleRowInput(state: QuestionState, data: string): void {
         if (state.typing) handleTypingInput(state, data)
         else if (matchesKey(data, Key.escape)) finish(null)
         else if (matchesKey(data, Key.enter)) confirmSelection(state)
         else if (data === ' ') toggleChecked(state)
+        else if (previews[active]) handlePreviewKey(state, data)
+      }
+      function handleQuestionInput(state: QuestionState, data: string): void {
+        if (state.notesOpen) handleNotesInput(state, data)
+        else if (moveFocus(state, data)) return
+        else handleRowInput(state, data)
         refresh()
       }
       function navigateWithKey(data: string): boolean {
-        if (states[active]?.typing) return false
+        if (states[active]?.typing || states[active]?.notesOpen) return false
         const next = matchesKey(data, Key.tab) || matchesKey(data, Key.right)
         const previous = matchesKey(data, Key.shift('tab')) || matchesKey(data, Key.left)
         if (!next && !previous) return false
@@ -941,21 +1079,30 @@ export async function askViaOverlay(specs: QuestionSpec[], ctx: ExtensionContext
         else handleReviewInput(data)
       }
 
-      /** The free-text row's lines; the first sits on the row, the rest under its text. */
-      function textField(state: QuestionState, width: number): string[] {
-        const draft = state.draft.getText()
-        // A confirmed text answer's tick takes two more columns after the text.
-        const room = Math.max(1, width - textIndent(state) - (state.mode === 'single' && state.confirmed?.kind === 'text' ? 2 : 0))
-        const placeholder = textRowLabel(state.mode === 'multi')
-        state.draft.focused = state.typing
-        if (state.typing && !draft) return [CURSOR_MARKER + renderFakeCursor(theme.fg('dim', placeholder[0])) + theme.fg('dim', placeholder.slice(1))]
+      /** An editor's lines in `room` columns: its text, or a placeholder (`open` when focused) while empty. */
+      function fieldLines(editor: Editor, focused: boolean, room: number, placeholder: string, open = placeholder): string[] {
+        const text = editor.getText()
+        editor.focused = focused
+        if (focused && !text) return [CURSOR_MARKER + renderFakeCursor(theme.fg('dim', open[0])) + theme.fg('dim', open.slice(1))]
         // pi's Editor draws a rule above and below its lines.
-        if (state.typing)
-          return state.draft
+        if (focused)
+          return editor
             .render(room)
             .slice(1, -1)
             .map((line) => line.trimEnd())
-        return draft ? draft.split('\n').flatMap((line) => wrapTextWithAnsi(line, room).map((part) => theme.fg('text', part))) : [theme.fg('dim', placeholder)]
+        return text ? text.split('\n').flatMap((line) => wrapTextWithAnsi(line, room).map((part) => theme.fg('text', part))) : [theme.fg('dim', placeholder)]
+      }
+      /** The free-text row's lines; the first sits on the row, the rest under its text. */
+      function textField(state: QuestionState, width: number): string[] {
+        // A confirmed text answer's tick takes two more columns after the text.
+        const tick = state.mode === 'single' && state.confirmed?.kind === 'text' ? 2 : 0
+        return fieldLines(state.draft, state.typing, Math.max(1, width - textIndent(state) - tick), textRowLabel(state.mode === 'multi'))
+      }
+      function previewView(index: number): PreviewView | undefined {
+        const markdown = previews[index]
+        const state = states[index]
+        if (!markdown) return undefined
+        return { markdown, widest: widestPreview(specs[index]), rows: tui.terminal.rows, notes: (room) => fieldLines(state.notes, state.notesOpen, room, 'press n to add notes', 'Add notes on this design…') }
       }
       function renderTabs(width: number, saved: Array<Answer | undefined>): string {
         const tabs = specs.map((spec, index) => {
@@ -988,14 +1135,22 @@ export async function askViaOverlay(specs: QuestionSpec[], ctx: ExtensionContext
         lines.push(theme.fg('muted', ' Ready to submit your answers?'), '', optionLine('Submit answers', 0, reviewIndex === 0, theme), optionLine('Cancel', 1, reviewIndex === 1, theme))
         return lines
       }
+      function questionBody(width: number, state: QuestionState): string[] {
+        const spec = specs[active]
+        const preview = previewView(active)
+        return buildQuestionLines({ width, question: theme.bold(spec.question), header: lone ? spec.header : undefined, state, field: preview ? [] : textField(state, width), theme, preview })
+      }
+      function hint(state: QuestionState | undefined): string {
+        if (state && previews[active]) return previewHint(!lone, state.notesOpen)
+        return navHint(specs[active]?.multiSelect === true, !lone, state?.typing === true)
+      }
       function render(width: number): string[] {
         width = Math.max(1, width)
         const state = states[active]
-        const spec = specs[active]
         const saved = answers()
         const rule = theme.fg('accent', '─'.repeat(width))
-        const lines = state ? buildQuestionLines({ width, question: theme.bold(spec.question), header: lone ? spec.header : undefined, state, field: textField(state, width), theme }) : [rule, ...reviewBody(width, saved)]
-        lines.push('', theme.fg('dim', navHint(spec?.multiSelect === true, !lone, state?.typing === true)))
+        const lines = state ? questionBody(width, state) : [rule, ...reviewBody(width, saved)]
+        lines.push('', ...wrapTextWithAnsi(hint(state), width).map((line) => theme.fg('dim', line)))
         if (countdown !== undefined) lines.push(theme.fg('warning', ` Auto-continuing in ${countdown}s if idle · press any key to stay`))
         lines.push(rule)
         // The tab bar sits inside the frame, under its top border.
@@ -1006,7 +1161,11 @@ export async function askViaOverlay(specs: QuestionSpec[], ctx: ExtensionContext
         render,
         handleInput,
         invalidate: () => {
-          for (const state of states) state.draft.invalidate()
+          for (const state of states) {
+            state.draft.invalidate()
+            state.notes.invalidate()
+          }
+          for (const markdown of previews.flat()) markdown?.invalidate()
         },
         dispose,
       }
