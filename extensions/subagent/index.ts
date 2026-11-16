@@ -197,7 +197,8 @@ export default function subagentExtension(pi: ExtensionAPI) {
   pi.on('agent_start', () => results.markPrompted(pi))
 
   pi.on('session_shutdown', (event, ctx) => {
-    results.detach(pi)
+    // A nested session's "quit" is its own teardown, not pi's.
+    if (!results.detach(pi)) return
     // On quit pi is exiting, so a detached background child would keep running (and
     // spending tokens) with its completion swallowed: SIGTERM every live run, killing the
     // process group the way a cancel does. On a same-process session switch

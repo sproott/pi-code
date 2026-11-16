@@ -205,8 +205,12 @@ describe('pi session replacement contract', () => {
           noExtensions: true,
           extensionFactories: [
             (pi) => {
-              pi.on('session_start', () => mailbox.attach(pi, true))
-              pi.on('session_shutdown', () => mailbox.detach(pi))
+              pi.on('session_start', () => {
+                mailbox.attach(pi, true)
+              })
+              pi.on('session_shutdown', () => {
+                mailbox.detach(pi)
+              })
             },
           ],
         },

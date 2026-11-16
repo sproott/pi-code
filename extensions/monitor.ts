@@ -491,8 +491,8 @@ export default function monitorExtension(pi: ExtensionAPI, limits: MonitorLimits
   pi.on('session_tree', (_event, ctx) => followBash(ctx))
   pi.on('agent_start', () => events.markPrompted(pi))
   pi.on('session_shutdown', (event) => {
-    events.detach(pi)
-    if (!ENDING_REASONS.has(event.reason)) return
+    // A nested session's "quit" is its own teardown, not pi's.
+    if (!events.detach(pi) || !ENDING_REASONS.has(event.reason)) return
     // On quit nothing is left to read any command's output; the bash extension does the
     // same, and stopping twice is harmless. A session switch ends only the watches.
     if (event.reason === 'quit') stopAllShells()

@@ -706,8 +706,21 @@ describe('monitor tool', () => {
     const id = idOf(await monitor({ command: 'sleep 30' }))
     emit('session_shutdown', { reason: 'reload' })
     expect(shell(id)?.state).toBe('running')
+    emit('session_start')
     emit('session_shutdown', { reason: 'quit' })
     expect(shell(id)?.state).toBe('killed')
+  })
+
+  it('should keep the parent monitor running and reporting when a nested in-process session quits', async () => {
+    const parent = setup()
+    const id = idOf(await parent.monitor({ command: 'sleep 0.3; echo done' }))
+    const nested = setup({ hasUI: false })
+
+    nested.emit('session_shutdown', { reason: 'quit' })
+
+    expect(shell(id)?.state, 'a nested quit must not stop the parent monitor').toBe('running')
+    await until(() => parent.sent.length > 0)
+    expect(parent.sent[0]?.message.content, 'the parent session must receive the monitor output').toContain('done')
   })
 
   it('leaves a session that starts without bash, and no other', () => {

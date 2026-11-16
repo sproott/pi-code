@@ -8,6 +8,10 @@
  * it, and one finishing while no session is attached waits for the next session_start.
  * Each delivery runs exactly once, on whichever `pi` is current when it runs.
  *
+ * pi detaches a replaced session before its successor starts, so a session that starts
+ * while another is still attached runs nested in the same process (an in-process
+ * subagent): it takes no delivery, and its shutdown is not the attached session's.
+ *
  * A delivery is told whether it may start a turn. pi 1.1.0 sends a turn that an extension
  * starts before the session's first prompt with no system prompt, and every later request
  * in that session goes without one too (measured with a bare extension, no pi-code). Until
@@ -35,12 +39,14 @@ export function sessionHasTurns(ctx: { sessionManager: { getBranch: () => Array<
 }
 
 export interface SessionMailbox {
-  /** The session's instance takes delivery; anything held meanwhile is delivered now. */
-  attach: (pi: ExtensionAPI, prompted: boolean) => void
+  /** The session's instance takes delivery; anything held meanwhile is delivered now.
+   * False for a nested session, which takes nothing. */
+  attach: (pi: ExtensionAPI, prompted: boolean) => boolean
   /** The current session has started a turn; later deliveries may start their own. */
   markPrompted: (pi: ExtensionAPI) => void
-  /** The instance's session is ending; later deliveries wait for the next attach. */
-  detach: (pi: ExtensionAPI) => void
+  /** The instance's session is ending; later deliveries wait for the next attach.
+   * False for an instance that was not attached. */
+  detach: (pi: ExtensionAPI) => boolean
   /** Run now on the current instance, or hold until one attaches. */
   deliver: (delivery: Delivery) => void
 }
@@ -57,6 +63,7 @@ export function sessionMailbox(name: string): SessionMailbox {
   return {
     attach(pi, prompted) {
       const state = box()
+      if (state.current && state.current !== pi) return false
       state.current = pi
       state.prompted = prompted
       for (const delivery of state.pending.splice(0)) {
@@ -66,6 +73,7 @@ export function sessionMailbox(name: string): SessionMailbox {
           // One failing delivery must not keep the rest from the session.
         }
       }
+      return true
     },
     markPrompted(pi) {
       const state = box()
@@ -73,7 +81,9 @@ export function sessionMailbox(name: string): SessionMailbox {
     },
     detach(pi) {
       const state = box()
-      if (state.current === pi) state.current = undefined
+      if (state.current !== pi) return false
+      state.current = undefined
+      return true
     },
     deliver(delivery) {
       const state = box()
