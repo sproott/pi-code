@@ -75,7 +75,8 @@ if (process.platform !== 'win32') process.env.TMP = tmpRoot
 process.env.PI_CODING_AGENT_DIR = path.join(tmpRoot, 'pi-agent')
 
 afterAll(() => {
-  fs.rmSync(tmpRoot, { recursive: true, force: true })
+  // On Windows a killed shell can still hold a handle under the root for a moment (EBUSY).
+  fs.rmSync(tmpRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 })
 })
 
 let snapshot: NodeJS.ProcessEnv
