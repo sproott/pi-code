@@ -321,7 +321,9 @@ export default function skillsExtension(pi: ExtensionAPI) {
     }
   })
   pi.on('agent_start', () => forkResults.markPrompted(pi))
-  pi.on('session_shutdown', () => forkResults.detach(pi))
+  pi.on('session_shutdown', () => {
+    forkResults.detach(pi)
+  })
 
   pi.on('resources_discover', (_event, ctx) => {
     // resources_discover fires after session_start, so the approval is already

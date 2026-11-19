@@ -295,14 +295,15 @@ export default function backgroundBashExtension(pi: ExtensionAPI, limits: { maxO
 
   pi.on('session_start', (_event, ctx) => {
     registerBash(backgroundAllowed(ctx))
-    notices.attach(pi, sessionHasTurns(ctx))
+    if (!notices.attach(pi, sessionHasTurns(ctx))) return
     setShellsListener(() => showFooter(ctx))
     // Commands that kept running across a session switch show from the start.
     showFooter(ctx)
   })
   pi.on('agent_start', () => notices.markPrompted(pi))
   pi.on('session_shutdown', (event) => {
-    notices.detach(pi)
+    // A nested session's "quit" is its own teardown, not pi's.
+    if (!notices.detach(pi)) return
     setShellsListener(undefined)
     // On quit nothing is left to read a command's output: stop them all. A session
     // switch or /reload keeps them running; their notices go to the next session.

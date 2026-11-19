@@ -1247,7 +1247,10 @@ describe('background agent count seam', () => {
 })
 
 describe('session_shutdown background runs', () => {
-  const shutdown = (reason: string, ctx: unknown) => eventHandlers.get('session_shutdown')?.({ reason }, ctx)
+  const shutdown = async (reason: string, ctx: unknown) => {
+    await startSession()
+    await eventHandlers.get('session_shutdown')?.({ reason }, ctx)
+  }
 
   it('SIGTERMs every live background run on quit without warning', async () => {
     activeBackgroundRunsMock.mockReturnValue(2)
