@@ -620,12 +620,130 @@ describe('question over dialogs (hasUI without tui)', () => {
     expect(result.details).toMatchObject({ answer: '', wasCustom: true })
   })
 
-  it('offers no free-text entry for multiSelect and prefixes the header in the title', async () => {
-    const { ctx, calls } = rpcCtx('1. Alpha')
-    const result = await setup().execute('call-1', { question: 'Pick some', header: 'Scope', options: OPTIONS, multiSelect: true } as never, undefined, undefined, ctx)
-    expect(calls).toEqual([{ kind: 'select', title: '[Scope] Pick some', options: ['1. Alpha', '2. Beta'] }])
-    expect(result.content).toEqual([{ type: 'text', text: 'User selected: Alpha' }])
-    expect(result.details).toEqual({ question: 'Pick some', header: 'Scope', options: ['Alpha', 'Beta'], answer: 'Alpha', wasCustom: false, multiSelect: true })
+  /** RPC-shaped ctx whose select picks come from `pick`, called with each round's entries. */
+  const scriptedCtx = (pick: (options: string[], round: number) => string | undefined, typed: Array<string | undefined> = []) => {
+    const selects: string[][] = []
+    const titles: string[] = []
+    const placeholders: Array<string | undefined> = []
+    const ctx = {
+      hasUI: true,
+      mode: 'rpc',
+      ui: {
+        custom: async () => undefined,
+        select: async (title: string, options: string[]) => {
+          titles.push(title)
+          selects.push(options)
+          return pick(options, selects.length - 1)
+        },
+        input: async (_title: string, placeholder?: string) => {
+          placeholders.push(placeholder)
+          return typed.shift()
+        },
+      },
+    }
+    return { ctx, selects, titles, placeholders }
+  }
+  const script = (picks: Array<string | undefined>) => (_options: string[], round: number) => picks[round]
+  const MULTI = { question: 'Pick some', header: 'Scope', options: OPTIONS, multiSelect: true }
+
+  it('should toggle multiSelect options until Done and prefix the header in the title', async () => {
+    const { ctx, selects, titles } = scriptedCtx(script(['1. [ ] Alpha', '2. [ ] Beta', '1. [✔] Alpha', 'Done']))
+    const result = await setup().execute('call-1', MULTI as never, undefined, undefined, ctx)
+    expect(titles[0], 'The header should prefix the title').toBe('[Scope] Pick some')
+    expect(selects[0], 'Each option should get a checkbox entry, then the text row and Done').toEqual(['1. [ ] Alpha', '2. [ ] Beta', '3. [ ] Type something…', 'Done'])
+    expect(selects[2], 'A pick should toggle its option').toEqual(['1. [✔] Alpha', '2. [✔] Beta', '3. [ ] Type something…', 'Done'])
+    expect(result.content, 'Done should send what is checked').toEqual([{ type: 'text', text: 'User selected: Beta' }])
+    expect(result.details).toEqual({ question: 'Pick some', header: 'Scope', options: ['Alpha', 'Beta'], answer: 'Beta', wasCustom: false, multiSelect: true })
+  })
+
+  it('should send checked options and typed text when the multiSelect text row is filled in', async () => {
+    const { ctx, selects, placeholders } = scriptedCtx(script(['1. [ ] Alpha', '3. [ ] Type something…', '3. [✔] first', 'Done']), ['first', ' second '])
+    const result = await setup().execute('call-1', MULTI as never, undefined, undefined, ctx)
+    expect(selects[2], 'The text row should show its text, checked').toEqual(['1. [✔] Alpha', '2. [ ] Beta', '3. [✔] first', 'Done'])
+    expect(placeholders, 'The input should show the current text').toEqual(['Your answer', 'first'])
+    expect(result.content).toEqual([{ type: 'text', text: 'User selected: Alpha\nUser wrote: second' }])
+  })
+
+  it('should uncheck the multiSelect text row when its text is submitted empty', async () => {
+    const { ctx } = scriptedCtx(script(['1. [ ] Alpha', '3. [ ] Type something…', '3. [✔] first', 'Done']), ['first', '  '])
+    const result = await setup().execute('call-1', MULTI as never, undefined, undefined, ctx)
+    expect(result.content, 'An empty submit should clear the text').toEqual([{ type: 'text', text: 'User selected: Alpha' }])
+  })
+
+  it('should leave a multiSelect question unanswered when Done is picked with nothing checked and no text', async () => {
+    const { ctx, selects } = scriptedCtx(script(['Done', '1. Alpha']))
+    const result = await setup().execute('call-1', { questions: [MULTI, { question: 'Pick one', options: OPTIONS }] } as never, undefined, undefined, ctx)
+    expect(selects, 'The batch should go on to the next question').toHaveLength(2)
+    expect(result.content).toEqual([{ type: 'text', text: 'Pick some\nUser skipped this question\n\nPick one\nUser selected: 1. Alpha' }])
+  })
+
+  it('should ask a lone multiSelect question again when Done is picked with nothing checked and no text', async () => {
+    const { ctx, selects } = scriptedCtx(script(['Done', '2. [ ] Beta', 'Done']))
+    const result = await setup().execute('call-1', MULTI as never, undefined, undefined, ctx)
+    expect(selects, 'An empty Done should show the list again').toHaveLength(3)
+    expect(result.content).toEqual([{ type: 'text', text: 'User selected: Beta' }])
+  })
+
+  // Each script goes on to a Done with Alpha checked, so only the cancel under test can end the call unanswered.
+  it('should cancel the whole call when a multiSelect select dialog is dismissed', async () => {
+    const result = await setup().execute('call-1', MULTI as never, undefined, undefined, scriptedCtx(script(['1. [ ] Alpha', undefined, 'Done'])).ctx)
+    expect(result.content, 'A dismissed select should cancel').toEqual([{ type: 'text', text: 'User cancelled the selection' }])
+  })
+
+  it('should cancel the whole call when the multiSelect text input is dismissed', async () => {
+    const result = await setup().execute('call-1', MULTI as never, undefined, undefined, scriptedCtx(script(['1. [ ] Alpha', '3. [ ] Type something…', 'Done']), [undefined]).ctx)
+    expect(result.content, 'A dismissed input should cancel').toEqual([{ type: 'text', text: 'User cancelled the selection' }])
+  })
+
+  it('should cancel the whole call when the client picks a multiSelect entry it was not offered', async () => {
+    const result = await setup().execute('call-1', MULTI as never, undefined, undefined, scriptedCtx(script(['1. [ ] Alpha', 'Alpha', 'Done'])).ctx)
+    expect(result.content, 'An unknown pick should cancel').toEqual([{ type: 'text', text: 'User cancelled the selection' }])
+  })
+
+  it('should send the text alone when Done is picked with only the multiSelect text row filled in', async () => {
+    const result = await setup().execute('call-1', MULTI as never, undefined, undefined, scriptedCtx(script(['3. [ ] Type something…', 'Done']), ['only']).ctx)
+    expect(result.content, 'Text alone should answer the question').toEqual([{ type: 'text', text: 'User wrote: only' }])
+  })
+
+  const openUntilAbort = (signal?: AbortSignal) => new Promise<undefined>((resolve) => signal?.addEventListener('abort', () => resolve(undefined), { once: true }))
+  it.each([
+    { dialog: 'single-select select', params: { question: 'Pick one', options: OPTIONS }, waitsIn: 'select' },
+    { dialog: 'single-select input', params: { question: 'Pick one', options: OPTIONS }, waitsIn: 'input' },
+    { dialog: 'multiSelect select', params: MULTI, waitsIn: 'select' },
+    { dialog: 'multiSelect input', params: MULTI, waitsIn: 'input' },
+  ])('should cancel when the turn is aborted while the $dialog dialog is open', async ({ params, waitsIn }) => {
+    const ctx = {
+      hasUI: true,
+      mode: 'rpc',
+      ui: {
+        custom: async () => undefined,
+        select: async (_title: string, options: string[], opts?: { signal?: AbortSignal }) => (waitsIn === 'select' ? openUntilAbort(opts?.signal) : options.find((option) => option.includes('Type something'))),
+        input: async (_title: string, _placeholder?: string, opts?: { signal?: AbortSignal }) => openUntilAbort(opts?.signal),
+      },
+    }
+    const controller = new AbortController()
+    const pending = setup().execute('call-1', params as never, controller.signal, undefined, ctx)
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    controller.abort()
+    expect((await pending).content, 'An abort should close the open dialog and cancel').toEqual([{ type: 'text', text: 'User cancelled the selection' }])
+  })
+
+  it('should stop asking multiSelect rounds once the turn is aborted', async () => {
+    const controller = new AbortController()
+    const { ctx, selects } = scriptedCtx((options) => {
+      controller.abort()
+      return options[0]
+    })
+    const result = await setup().execute('call-1', MULTI as never, controller.signal, undefined, ctx)
+    expect(selects, 'No round should follow the abort').toHaveLength(1)
+    expect(result.content).toEqual([{ type: 'text', text: 'User cancelled the selection' }])
+  })
+
+  it('should cancel a multiSelect question when the client never picks Done', async () => {
+    const { ctx, selects } = scriptedCtx((options) => options[0])
+    const result = await setup().execute('call-1', MULTI as never, undefined, undefined, ctx)
+    expect(selects, 'The loop should stop at its round cap').toHaveLength(32)
+    expect(result.content, 'Running out of rounds should not send a partial selection').toEqual([{ type: 'text', text: 'User cancelled the selection' }])
   })
 })
 
