@@ -159,17 +159,20 @@ function optionLine(label: string, index: number, selected: boolean, theme: Them
 }
 
 /** One row of a question; the cursor indexes into the question's rows. */
-type Row = { kind: 'option'; index: number; option: OptionWithDesc } | { kind: 'text' } | { kind: 'chat' }
+type Row = { kind: 'option'; index: number; option: OptionWithDesc } | { kind: 'text' } | { kind: 'next'; label: 'Next' | 'Submit' } | { kind: 'chat' }
 
 /** A single-select question with any `preview`, blank included, shows the preview layout; multiSelect ignores previews. */
 function hasPreviews(spec: QuestionSpec): boolean {
   return spec.multiSelect !== true && spec.options.some((option) => typeof option.preview === 'string')
 }
 
-/** The preview layout has notes in place of the free-text row. */
-function questionRows(spec: QuestionSpec): Row[] {
+/** The preview layout has notes in place of the free-text row. A multiSelect question ends with a
+ * Next row, or Submit on the last question, as in Claude Code. */
+function questionRows(spec: QuestionSpec, last: boolean): Row[] {
   const options = spec.options.map((option, index): Row => ({ kind: 'option', index, option }))
-  return hasPreviews(spec) ? [...options, { kind: 'chat' }] : [...options, { kind: 'text' }, { kind: 'chat' }]
+  if (hasPreviews(spec)) return [...options, { kind: 'chat' }]
+  const next: Row[] = spec.multiSelect ? [{ kind: 'next', label: last ? 'Submit' : 'Next' }] : []
+  return [...options, { kind: 'text' }, ...next, { kind: 'chat' }]
 }
 
 /** `notes` is an answer made of the question's notes alone, with no option chosen. */
@@ -366,8 +369,11 @@ function rowLines(view: QuestionView, row: Row, i: number): string[] {
       const pad = ' '.repeat(textIndent(state))
       return [optionLine('', i, selected, theme, { field: field[0], box: box(state.draft.getText().trim() !== ''), confirmed: confirmed?.kind === 'text', width }), ...field.slice(1).map((line) => pad + line)]
     }
+    case 'next':
+      return [(selected ? theme.fg('accent', '❯ ') : '  ') + '   ' + theme.bold(theme.fg(selected ? 'accent' : 'text', row.label))]
     case 'chat':
-      return [theme.fg('dim', '─'.repeat(width)), optionLine('Chat about this', i, selected, theme)]
+      // The unnumbered Next row does not take a number.
+      return [theme.fg('dim', '─'.repeat(width)), optionLine('Chat about this', state.rows.filter((other) => other.kind !== 'next').length - 1, selected, theme)]
     default:
       return unreachable(row)
   }
@@ -831,6 +837,8 @@ const IDLE_TICK_MS = 250
 export async function askViaOverlay(specs: QuestionSpec[], ctx: ExtensionContext, timeoutMs?: number, events?: ExtensionAPI['events'], signal?: AbortSignal): Promise<FormResult | null> {
   const saved: Array<Answer | undefined> = specs.map(() => undefined)
   const lone = specs.length === 1
+  // A lone multiSelect question gets the tab bar and the Submit review too, as in Claude Code.
+  const tabs = !lone || specs[0].multiSelect === true
   const batchId = lone ? undefined : randomUUID()
   // One offer per question, made before the form opens and live until that question is settled.
   const remotes: Array<RemoteQuestion | undefined> = specs.map(() => undefined)
@@ -855,8 +863,8 @@ export async function askViaOverlay(specs: QuestionSpec[], ctx: ExtensionContext
         selectList: { selectedPrefix: (text: string) => theme.fg('accent', text), selectedText: (text: string) => theme.fg('accent', text), description: (text: string) => theme.fg('muted', text), scrollInfo: (text: string) => theme.fg('dim', text), noMatch: (text: string) => theme.fg('dim', text) },
       }
       let editing = false
-      const states = specs.map((spec): QuestionState => {
-        const common = { rows: questionRows(spec), cursor: 0, typing: false, draft: new Editor(tui, editorTheme), notes: new Editor(tui, editorTheme), notesOpen: false }
+      const states = specs.map((spec, index): QuestionState => {
+        const common = { rows: questionRows(spec, index === specs.length - 1), cursor: 0, typing: false, draft: new Editor(tui, editorTheme), notes: new Editor(tui, editorTheme), notesOpen: false }
         return spec.multiSelect ? { ...common, mode: 'multi', checked: spec.options.map(() => false) } : { ...common, mode: 'single' }
       })
       const markdownTheme = getMarkdownTheme()
@@ -962,7 +970,7 @@ export async function askViaOverlay(specs: QuestionSpec[], ctx: ExtensionContext
       function commit(value: Answer): void {
         confirm(states[active], value)
         remotes[active]?.close()
-        if (lone) finish({ kind: 'submit', answers: [value] })
+        if (!tabs) finish({ kind: 'submit', answers: [value] })
         else navigate(active + 1)
       }
       signal?.addEventListener('abort', abort, { once: true })
@@ -987,18 +995,18 @@ export async function askViaOverlay(specs: QuestionSpec[], ctx: ExtensionContext
         if (row.kind === 'chat') finish({ kind: 'chat', answers: answers() })
         else if (row.kind === 'text' && !state.typing) state.typing = true
         else if (state.mode === 'multi') confirmChecked(state)
-        else confirmRow(state, row)
+        else if (row.kind !== 'next') confirmRow(state, row)
       }
       function confirmChecked(state: Extract<QuestionState, { mode: 'multi' }>): void {
         const answer = multiAnswer(state.checked, state.draft.getText().trim())
         if (answer.indices.length > 0 || answer.text) commit(answer)
-        else if (!lone) {
-          // Nothing filled in leaves the question unanswered; a lone question has nowhere to advance.
+        else {
+          // Nothing filled in leaves the question unanswered.
           state.confirmed = undefined
           navigate(active + 1)
         }
       }
-      function confirmRow(state: QuestionState, row: Exclude<Row, { kind: 'chat' }>): void {
+      function confirmRow(state: QuestionState, row: Extract<Row, { kind: 'option' | 'text' }>): void {
         switch (row.kind) {
           case 'text': {
             const text = state.draft.getText().trim()
@@ -1098,7 +1106,7 @@ export async function askViaOverlay(specs: QuestionSpec[], ctx: ExtensionContext
       function handleInput(data: string): void {
         if (finished || editing) return
         resetIdleTimer()
-        if (!lone && navigateWithKey(data)) return
+        if (tabs && navigateWithKey(data)) return
         const state = states[active]
         if (state) handleQuestionInput(state, data)
         else handleReviewInput(data)
@@ -1163,11 +1171,11 @@ export async function askViaOverlay(specs: QuestionSpec[], ctx: ExtensionContext
       function questionBody(width: number, state: QuestionState): string[] {
         const spec = specs[active]
         const preview = previewView(active)
-        return buildQuestionLines({ width, question: theme.bold(spec.question), header: lone ? spec.header : undefined, state, field: preview ? [] : textField(state, width), theme, preview })
+        return buildQuestionLines({ width, question: theme.bold(spec.question), header: tabs ? undefined : spec.header, state, field: preview ? [] : textField(state, width), theme, preview })
       }
       function hint(state: QuestionState | undefined): string {
-        if (state && previews[active]) return previewHint(!lone, state.notesOpen)
-        return navHint(specs[active]?.multiSelect === true, !lone, state?.typing === true)
+        if (state && previews[active]) return previewHint(tabs, state.notesOpen)
+        return navHint(specs[active]?.multiSelect === true, tabs, state?.typing === true)
       }
       function render(width: number): string[] {
         width = Math.max(1, width)
@@ -1179,7 +1187,7 @@ export async function askViaOverlay(specs: QuestionSpec[], ctx: ExtensionContext
         if (countdown !== undefined) lines.push(theme.fg('warning', ` Auto-continuing in ${countdown}s if idle · press any key to stay`))
         lines.push(rule)
         // The tab bar sits inside the frame, under its top border.
-        if (!lone) lines.splice(1, 0, renderTabs(width, saved), '')
+        if (tabs) lines.splice(1, 0, renderTabs(width, saved), '')
         return lines.map((line) => truncateToWidth(line, width))
       }
       return {
