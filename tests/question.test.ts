@@ -416,7 +416,7 @@ describe('question remote offer', () => {
     const custom = vi.fn(async () => null)
     const choose = setupRemote((offer) => {
       expect(offer.multiSelect).toBe(true)
-      expect(offer.allowFreeText).toBe(false)
+      expect(offer.allowFreeText).toBe(true)
       offer.claim()?.({ action: 'answer', indices: [2, 1] })
     })
     const selected = await choose.execute('call-1', { question: 'Pick some', options: OPTIONS, multiSelect: true } as never, undefined, undefined, context(custom))
@@ -424,6 +424,35 @@ describe('question remote offer', () => {
     const typed = await setupRemote((offer) => offer.claim()?.({ action: 'text', text: ' another ' })).execute('call-2', { question: 'Pick one', options: OPTIONS }, undefined, undefined, context(custom))
     expect(typed.details).toMatchObject({ answer: 'another', wasCustom: true })
     expect(custom).not.toHaveBeenCalled()
+  })
+
+  it('should answer a multiSelect question with free text alone when a remote responder sends text', async () => {
+    const custom = vi.fn(async () => null)
+    const result = await setupRemote((offer) => offer.claim()?.({ action: 'text', text: ' something else ' })).execute('call-1', { question: 'Pick some', options: OPTIONS, multiSelect: true } as never, undefined, undefined, context(custom))
+    expect(result.content, 'Text alone should check nothing and send only the text').toEqual([{ type: 'text', text: 'User wrote: something else' }])
+    expect(result.details).toMatchObject({ answer: 'something else', multiSelect: true })
+    expect(custom).not.toHaveBeenCalled()
+  })
+
+  it('should send checked options and free text when a remote multiSelect answer carries text', async () => {
+    const custom = vi.fn(async () => null)
+    const result = await setupRemote((offer) => offer.claim()?.({ action: 'answer', indices: [2], text: ' and more ' })).execute('call-1', { question: 'Pick some', options: OPTIONS, multiSelect: true } as never, undefined, undefined, context(custom))
+    expect(result.content, 'The text should follow the checked labels on its own line').toEqual([{ type: 'text', text: 'User selected: Beta\nUser wrote: and more' }])
+    expect(custom).not.toHaveBeenCalled()
+  })
+
+  it('should ignore the text when a remote single-select answer carries one', async () => {
+    const custom = vi.fn(async () => null)
+    const result = await setupRemote((offer) => offer.claim()?.({ action: 'answer', indices: [2], text: 'extra' })).execute('call-1', { question: 'Pick one', options: OPTIONS }, undefined, undefined, context(custom))
+    expect(result.content, 'A single-select answer should ignore its text').toEqual([{ type: 'text', text: 'User selected: 2. Beta' }])
+    expect(custom, 'The overlay should not open').not.toHaveBeenCalled()
+  })
+
+  it('should ignore the text when a remote multiSelect answer carries one that is not a string', async () => {
+    const custom = vi.fn(async () => null)
+    const result = await setupRemote((offer) => offer.claim()?.({ action: 'answer', indices: [1], text: 7 } as never)).execute('call-1', { question: 'Pick some', options: OPTIONS, multiSelect: true } as never, undefined, undefined, context(custom))
+    expect(result.content, 'A text that is not a string should be ignored').toEqual([{ type: 'text', text: 'User selected: Alpha' }])
+    expect(custom, 'The overlay should not open').not.toHaveBeenCalled()
   })
 
   it('ends a remote batch on explicit cancellation', async () => {
@@ -454,10 +483,11 @@ describe('question remote offer', () => {
     const pastLast = await setupRemote((offer) => offer.claim()?.({ action: 'answer', indices: [OPTIONS.length + 1] })).execute('call-0', { question: 'Pick one', options: OPTIONS }, undefined, undefined, context(custom))
     const invalid = await setupRemote((offer) => offer.claim()?.({ action: 'answer', indices: [0] })).execute('call-1', { question: 'Pick one', options: OPTIONS }, undefined, undefined, context(custom))
     const duplicate = await setupRemote((offer) => offer.claim()?.({ action: 'answer', indices: [1, 1] })).execute('call-2', { question: 'Pick some', options: OPTIONS, multiSelect: true } as never, undefined, undefined, context(custom))
-    const forbiddenText = await setupRemote((offer) => offer.claim()?.({ action: 'text', text: 'not allowed' })).execute('call-3', { question: 'Pick some', options: OPTIONS, multiSelect: true } as never, undefined, undefined, context(custom))
+    const blankText = await setupRemote((offer) => offer.claim()?.({ action: 'text', text: '  ' })).execute('call-3', { question: 'Pick some', options: OPTIONS, multiSelect: true } as never, undefined, undefined, context(custom))
     const declined = await setupRemote((offer) => offer.claim()?.({ action: 'pass' })).execute('call-4', { question: 'Pick one', options: OPTIONS }, undefined, undefined, context(custom))
-    for (const result of [pastLast, invalid, duplicate, forbiddenText, declined]) expect(result.details).toMatchObject({ answer: 'Alpha' })
-    expect(custom).toHaveBeenCalledTimes(5)
+    const empty = await setupRemote((offer) => offer.claim()?.({ action: 'answer', indices: [], text: '  ' })).execute('call-5', { question: 'Pick some', options: OPTIONS, multiSelect: true } as never, undefined, undefined, context(custom))
+    for (const result of [pastLast, invalid, duplicate, blankText, declined, empty]) expect(result.details).toMatchObject({ answer: 'Alpha' })
+    expect(custom).toHaveBeenCalledTimes(6)
   })
 
   it('settles as cancelled on the abort that precedes session replacement, never reading the stale ctx', async () => {
@@ -2910,6 +2940,28 @@ describe('question batch lifecycle', () => {
     expect(offers[0].signal.aborted, 'Chat should close the offer still live').toBe(true)
     expect(replies[0]?.({ action: 'answer', indices: [1] }), 'A reply after Chat should be rejected').toBe(false)
     expect(submitted.content[0].text, 'The remote answer should be listed as confirmed').toMatch(/- "First\?"\n {2}\(No answer provided\)\n- "Second\?"\n {2}Answer: Beta$/)
+  })
+
+  it('should show remote multi-select text in the free-text row when the remote answer carries text', async () => {
+    const replies: Array<ReturnType<RemoteQuestionOffer['claim']>> = []
+    const tool = setupRemote((offer) => {
+      replies.push(offer.claim())
+    })
+    const { overlay, result } = openOverlayWith(tool, {
+      questions: [
+        { question: 'First?', options: OPTIONS, multiSelect: true },
+        { question: 'Second?', options: OPTIONS },
+      ],
+    })
+
+    replies[0]?.({ action: 'answer', indices: [2], text: 'remote words' })
+    overlay.handleInput(RAW.left)
+    const rendered = stripTerminalSequences(overlay.render(120).join('\n'))
+    overlay.handleInput(RAW.escape)
+    await result
+
+    expect(rendered, 'The remote answer should check its option').toContain('2. [✔] Beta')
+    expect(rendered, 'The remote text should fill and check the free-text row').toContain('3. [✔] remote words')
   })
 
   it('should cancel after remote withdrawal when the turn aborts', async () => {
