@@ -1011,22 +1011,24 @@ describe('question overlay', () => {
 describe('question header and multiSelect', () => {
   const multiParams = { question: 'Pick some', header: 'Scope', options: OPTIONS, multiSelect: true }
 
-  it('should show the header, the multi-select hint and an unboxed free-text row when one question is multiSelect', () => {
+  it('should show a tab bar, the multi-select hint, a Submit row and an unboxed free-text row when one question is multiSelect', () => {
     const { overlay } = openOverlayWith(setup(), multiParams)
     const out = overlay.render(80)
-    expect(out[1], 'A lone question should show its header with no tab bar').toBe(' ☐ Scope ')
+    expect(out[1], 'A lone multiSelect question should show the tab bar with its Submit tab, as in Claude Code').toBe('←  ☐ Scope   ✔ Submit  →')
     expect(out).toContain(' Pick some')
     expect(out).toContain('❯ 1. [ ] Alpha')
     expect(out).toContain('  2. [ ] Beta')
     expect(out, 'The empty free-text row should show an unchecked box').toContain('  3. [ ] Type something')
-    expect(out).toContain(' Space to toggle · ↑/↓ to navigate · Enter to confirm · Esc to cancel')
+    expect(out, 'The Submit row should sit unnumbered under the labels').toContain('     Submit')
+    expect(out, 'Chat about this should keep the next number').toContain('  4. Chat about this')
+    expect(out).toContain(' Space to toggle · Tab/Arrow keys to navigate · Enter to confirm · Esc to cancel')
   })
 
   it('should show the header as a highlighted chip under the border and the question in bold', () => {
     const marked = { fg: (_color: string, s: string) => s, bg: (color: string, s: string) => `<${color}>${s}</${color}>`, bold: (s: string) => `*${s}*` }
     let overlay: Overlay | undefined
     const ctx = { hasUI: true, mode: 'tui', ui: { custom: (factory: CustomFactory) => new Promise(() => (overlay = factory(fakeTui(), marked, KEYS, () => {}))) } }
-    void setup().execute('call-1', multiParams as never, undefined, undefined, ctx)
+    void setup().execute('call-1', { ...multiParams, multiSelect: false } as never, undefined, undefined, ctx)
     const out = overlay?.render(80) ?? []
     expect(out.slice(1, 4)).toEqual(['<selectedBg> ☐ Scope </selectedBg>', '', ' *Pick some*'])
   })
@@ -1117,7 +1119,7 @@ describe('question header and multiSelect', () => {
     const out = overlay.render(80).map(stripTerminalSequences)
 
     expect(out.join('\n'), 'Space should type into the row').toContain('❯ 3. [✔] a b')
-    expect(out, 'The hint should drop Space and offer the external editor while typing').toContain(' ↑/↓ to navigate · Enter to confirm · Ctrl+G to edit · Esc to cancel')
+    expect(out, 'The hint should drop Space and offer the external editor while typing').toContain(' Tab/Arrow keys to navigate · Enter to confirm · Ctrl+G to edit · Esc to cancel')
     expect(out, 'No other option should be toggled').toEqual(expect.arrayContaining(['  1. [ ] Alpha', '  2. [ ] Beta']))
   })
 
@@ -1144,6 +1146,7 @@ describe('question header and multiSelect', () => {
     overlay.handleInput(RAW.down)
     overlay.handleInput('Gamma')
     overlay.handleInput(RAW.enter)
+    overlay.handleInput(RAW.enter)
     const submitted = await result
 
     expect(submitted.content[0].text, 'The model should get the checked labels and the typed text').toBe('User selected: Alpha\nUser wrote: Gamma')
@@ -1155,6 +1158,7 @@ describe('question header and multiSelect', () => {
     overlay.handleInput(RAW.down)
     overlay.handleInput(RAW.down)
     overlay.handleInput('Gamma')
+    overlay.handleInput(RAW.enter)
     overlay.handleInput(RAW.enter)
     expect((await result).content[0].text, 'Only the typed text should be sent').toBe('User wrote: Gamma')
   })
@@ -1173,18 +1177,75 @@ describe('question header and multiSelect', () => {
     overlay.handleInput(RAW.down)
     overlay.handleInput(RAW.space) // Beta
     overlay.handleInput(RAW.enter)
+    overlay.handleInput(RAW.enter)
     expect(await result).toEqual({
       content: [{ type: 'text', text: 'User selected: Alpha, Beta' }],
       details: { question: 'Pick some', header: 'Scope', options: ['Alpha', 'Beta'], answer: 'Alpha, Beta', wasCustom: false, multiSelect: true },
     })
   })
 
-  it('should stay open when Enter is pressed with nothing checked on a single multi-select question', async () => {
-    const { overlay, result } = openOverlayWith(setup(), multiParams)
-    overlay.handleInput(RAW.enter)
+  it('should open the review when Enter is pressed on a lone multi-select question', () => {
+    const { overlay } = openOverlayWith(setup(), multiParams)
     overlay.handleInput(RAW.space)
     overlay.handleInput(RAW.enter)
-    expect((await result).content, 'Only the Enter after checking an option should answer').toEqual([{ type: 'text', text: 'User selected: Alpha' }])
+    const out = overlay.render(80)
+    expect(out, 'Enter should confirm the checks and open the review, as in Claude Code').toEqual(expect.arrayContaining([' Review your answers', '   → Alpha', '❯ 1. Submit answers']))
+  })
+
+  it('should open the review with a warning when Enter is pressed with nothing checked on a lone multi-select question', () => {
+    const { overlay } = openOverlayWith(setup(), multiParams)
+    overlay.handleInput(RAW.enter)
+    expect(overlay.render(80), 'The question should be left unanswered').toContain(' ⚠ You have not answered all questions')
+  })
+
+  it('should label the row Next on a multi-select question before the last one and Submit on the last', () => {
+    const { overlay } = openOverlayWith(setup(), { questions: [multiParams, multiParams] })
+    const first = overlay.render(80)
+    overlay.handleInput(RAW.right)
+    const last = overlay.render(80)
+    expect(first, 'A question with more to come should offer Next').toContain('     Next')
+    expect(last, 'The last question should offer Submit').toContain('     Submit')
+  })
+
+  it('should stop on the Submit row between the free-text row and Chat about this', () => {
+    const { overlay } = openOverlayWith(setup(), multiParams)
+    overlay.handleInput(RAW.down)
+    overlay.handleInput(RAW.down)
+    overlay.handleInput(RAW.down)
+    const onRow = overlay.render(80)
+    overlay.handleInput(RAW.down)
+    expect(onRow, 'Down from the free-text row should focus Submit').toContain('❯    Submit')
+    expect(overlay.render(80), 'The next Down should focus Chat about this').toContain('❯ 4. Chat about this')
+  })
+
+  it('should draw the Submit row bold in the text colour, and in the accent colour when focused', () => {
+    const tagged = { fg: (color: string, s: string) => `<${color}>${s}</${color}>`, bg: (_color: string, s: string) => s, bold: (s: string) => `*${s}*` }
+    const { overlay } = openOverlayWith(setup(), multiParams, tagged)
+    const idle = overlay.render(80)
+    overlay.handleInput(RAW.down)
+    overlay.handleInput(RAW.down)
+    overlay.handleInput(RAW.down)
+    expect(idle, 'An unfocused Submit row should be in the text colour').toContain('     *<text>Submit</text>*')
+    expect(overlay.render(80), 'A focused Submit row should be in the accent colour').toContain('<accent>❯ </accent>   *<accent>Submit</accent>*')
+  })
+
+  it('should leave the question unanswered and move on when Enter is pressed on Next with nothing checked', () => {
+    const { overlay } = openOverlayWith(setup(), { questions: [multiParams, { question: 'Second?', options: OPTIONS }] })
+    overlay.handleInput(RAW.down)
+    overlay.handleInput(RAW.down)
+    overlay.handleInput(RAW.down)
+    overlay.handleInput(RAW.enter)
+    const out = overlay.render(80)
+    expect(out, 'The next question should open').toContain(' Second?')
+    expect(out[1], 'The first tab should stay unanswered').toContain('☐ Scope')
+  })
+
+  it('should keep a lone single-select question without a tab bar or a Submit row', () => {
+    const { overlay } = openOverlayWith(setup(), { question: 'One?', options: OPTIONS })
+    overlay.handleInput(RAW.right)
+    const out = overlay.render(80)
+    expect(out.join('\n'), 'Only a multiSelect question gets the review').not.toContain('Submit')
+    expect(out, 'Right should not leave the question').toContain(' One?')
   })
 
   it('should render the header, multi tag and free-text entry in the call when the question is multiSelect', () => {
@@ -1530,11 +1591,10 @@ describe('question navigation hints', () => {
       return overlay.render(200).at(-2) ?? ''
     }
 
-    const hints = [hint(single), hint(multi), hint(single, typing), hint(pair), hint({ questions: [multi, single] }), hint(pair, typing), hint(pair, [RAW.right, RAW.right]), hint({ questions: [multi, single] }, [RAW.down, RAW.down])]
+    const hints = [hint(single), hint(single, typing), hint(pair), hint({ questions: [multi, single] }), hint(pair, typing), hint(pair, [RAW.right, RAW.right]), hint({ questions: [multi, single] }, [RAW.down, RAW.down])]
 
     expect(hints, 'Each form state should show its own keys').toEqual([
       ' Enter to select · ↑/↓ to navigate · Esc to cancel',
-      ' Space to toggle · ↑/↓ to navigate · Enter to confirm · Esc to cancel',
       ' Enter to select · ↑/↓ to navigate · Ctrl+G to edit · Esc to cancel',
       ' Enter to select · Tab/Arrow keys to navigate · Esc to cancel',
       ' Space to toggle · Tab/Arrow keys to navigate · Enter to confirm · Esc to cancel',
@@ -1820,7 +1880,7 @@ describe('question batch submission', () => {
     overlay.handleInput(RAW.left)
     overlay.handleInput(RAW.down)
     overlay.handleInput(RAW.space)
-    for (let i = 0; i < 2; i++) overlay.handleInput(RAW.down)
+    for (let i = 0; i < 3; i++) overlay.handleInput(RAW.down)
     overlay.handleInput(RAW.enter)
     const submitted = await result
 
