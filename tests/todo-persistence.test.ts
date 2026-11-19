@@ -13,6 +13,7 @@ const setup = () => {
   let execute: (id: string, params: Record<string, unknown>) => Promise<Result>
   todoExtension({
     appendEntry: (customType: string, snapshot: Snapshot) => entries.push({ type: 'custom', customType, data: snapshot }),
+    getSettings: () => ({}),
     on: (name: string, handler: (event: unknown, ctx: unknown) => unknown) => handlers.set(name, handler),
     registerCommand: () => {},
     registerTool: (tool: { execute: typeof execute }) => {

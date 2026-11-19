@@ -18,11 +18,10 @@
 import * as crypto from 'node:crypto'
 import * as fs from 'node:fs'
 import * as path from 'node:path'
-import { getAgentDir } from '@earendil-works/pi-coding-agent'
-import { atomicWriteFile } from './atomic-write.ts'
 import { cliSettings } from './cli-settings.ts'
 import { claudeConfigDir } from './config-dir.ts'
 import { readManagedSettings } from './managed-settings.ts'
+import { piSettingsFile, stripBom, updatePiCodeSettings } from './pi-settings.ts'
 import { userSettingsFiles } from './settings-chain.ts'
 import { statToken } from './stat-token.ts'
 import { errorMessage, isDirectory, isRecord, realpathOr } from './values.ts'
@@ -196,18 +195,6 @@ function enabledMap(settingsFiles: string[]): Record<string, boolean> {
     }
   }
   return merged
-}
-
-/** pi's own settings.json, whose `piCode.enabledPlugins` overrides Claude's enablement in pi
- * only: Claude Code shares `~/.claude/settings.json` and never reads this file. */
-function piSettingsFile(): string {
-  return path.join(getAgentDir(), 'settings.json')
-}
-
-/** pi's settings reader strips a leading UTF-8 byte order mark before it parses, so a
- * settings.json pi accepts can begin with one. */
-function stripBom(raw: string): string {
-  return raw.startsWith('\uFEFF') ? raw.slice(1) : raw
 }
 
 function piEnabledMap(): Record<string, boolean> {
@@ -451,25 +438,14 @@ export function pluginStates(home: string): PluginState[] {
  * Claude's settings without one, would not already give that state. Throws on a settings
  * file that cannot be read or does not parse, which a rewrite would destroy. */
 export function setPiPluginEnabled(state: Pick<PluginState, 'qualified' | 'directory' | 'withoutPi'>, wanted: boolean): void {
-  const file = piSettingsFile()
-  let raw: string | undefined
-  try {
-    raw = fs.readFileSync(file, 'utf-8')
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
-  }
-  const parsed: unknown = raw === undefined ? {} : JSON.parse(stripBom(raw))
-  if (!isRecord(parsed)) throw new Error(`${file} is not a JSON object`)
-  const piCode = isRecord(parsed.piCode) ? parsed.piCode : {}
-  const entries = isRecord(piCode.enabledPlugins) ? { ...piCode.enabledPlugins } : {}
-  delete entries[state.qualified]
-  // The bare-name entry stays: it can also decide same-named plugins from other marketplaces.
-  const bare = entries[state.directory]
-  if ((typeof bare === 'boolean' ? bare : state.withoutPi) !== wanted) entries[state.qualified] = wanted
-  parsed.piCode = { ...piCode, enabledPlugins: entries }
-  fs.mkdirSync(path.dirname(file), { recursive: true })
-  // No lock is shared with pi's own settings writer, so a pi write that lands between the read above and this rename is lost.
-  atomicWriteFile(file, `${JSON.stringify(parsed, null, 2)}\n`)
+  updatePiCodeSettings((piCode) => {
+    const entries = isRecord(piCode.enabledPlugins) ? { ...piCode.enabledPlugins } : {}
+    delete entries[state.qualified]
+    // The bare-name entry stays: it can also decide same-named plugins from other marketplaces.
+    const bare = entries[state.directory]
+    if ((typeof bare === 'boolean' ? bare : state.withoutPi) !== wanted) entries[state.qualified] = wanted
+    return { ...piCode, enabledPlugins: entries }
+  })
 }
 
 /** A plugin component path, resolved inside the plugin root. Claude "rejects a component
