@@ -10,16 +10,16 @@
  * manages memories through the memory tool (save / read / delete / list).
  */
 
-import { spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import * as fs from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
 import { StringEnum } from '@earendil-works/pi-ai'
-import { type ExtensionAPI, type ExtensionCommandContext, getAgentDir, SettingsManager, withFileMutationQueue } from '@earendil-works/pi-coding-agent'
+import { type ExtensionAPI, type ExtensionCommandContext, getAgentDir, withFileMutationQueue } from '@earendil-works/pi-coding-agent'
 import { Type } from 'typebox'
 import { atomicWriteFile } from './internal/atomic-write.ts'
 import { claudeConfigDir } from './internal/config-dir.ts'
+import { externalEditorCommand, runExternalEditor } from './internal/external-editor.ts'
 import { readManagedSettings } from './internal/managed-settings.ts'
 import { capForContext } from './internal/output-guard.ts'
 import { isProjectApprovedSilently } from './internal/project-approval.ts'
@@ -810,7 +810,7 @@ async function editMemoryFile(ctx: ExtensionCommandContext, home: string): Promi
   const choice = await ctx.ui.select('Edit which memory file?', options)
   const picked = files[options.indexOf(choice ?? '')]
   if (!picked) return
-  const command = SettingsManager.create(ctx.cwd, getAgentDir()).getExternalEditorCommand()
+  const command = externalEditorCommand(ctx.cwd)
   try {
     fs.mkdirSync(path.dirname(picked.file), { recursive: true })
   } catch (error) {
@@ -818,19 +818,7 @@ async function editMemoryFile(ctx: ExtensionCommandContext, home: string): Promi
     return
   }
   const code = await ctx.ui.custom<number | null>((tui, _theme, _keybindings, done) => {
-    tui.stop()
-    let finished = false
-    const finish = (exit: number | null): void => {
-      if (finished) return
-      finished = true
-      tui.start()
-      tui.requestRender(true)
-      done(exit)
-    }
-    const [editor, ...editorArgs] = command.split(' ')
-    const child = spawn(editor, [...editorArgs, picked.file], { stdio: 'inherit', shell: process.platform === 'win32' })
-    child.on('error', () => finish(null))
-    child.on('close', (exit) => finish(exit))
+    void runExternalEditor(tui, command, picked.file).then(done)
     return { render: () => [], invalidate: () => {} }
   })
   if (code === 0) return

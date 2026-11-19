@@ -10,8 +10,9 @@
 import { randomUUID } from 'node:crypto'
 import * as os from 'node:os'
 import type { ExtensionAPI, ExtensionContext, Theme } from '@earendil-works/pi-coding-agent'
-import { Input, Key, matchesKey, Text, truncateToWidth, visibleWidth, wrapTextWithAnsi } from '@earendil-works/pi-tui'
+import { CURSOR_MARKER, Editor, Key, matchesKey, renderFakeCursor, Text, truncateToWidth, visibleWidth, wrapTextWithAnsi } from '@earendil-works/pi-tui'
 import { Type } from 'typebox'
+import { editTextExternally, externalEditorCommand } from './internal/external-editor.ts'
 import { readManagedSettings } from './internal/managed-settings.ts'
 import { readUserSetting } from './internal/settings-chain.ts'
 
@@ -171,11 +172,11 @@ type Outcome = Answer | TimedOut
 type FormResult = { kind: 'submit'; answers: Array<Answer | undefined> } | { kind: 'timeout'; answers: Outcome[] } | { kind: 'chat'; answers: Array<Answer | undefined> }
 
 /** A question is answered exactly when `confirmed` is set. */
-type QuestionState = { rows: Row[]; cursor: number; typing: boolean; draft: Input } & ({ mode: 'single'; confirmed?: SingleAnswer } | { mode: 'multi'; checked: boolean[]; confirmed?: MultiAnswer })
+type QuestionState = { rows: Row[]; cursor: number; typing: boolean; draft: Editor } & ({ mode: 'single'; confirmed?: SingleAnswer } | { mode: 'multi'; checked: boolean[]; confirmed?: MultiAnswer })
 
 /** Text still being typed counts once typing stops, so a remote answer never submits a half-typed draft. */
 function settledText(state: QuestionState): string {
-  return state.typing ? '' : state.draft.getValue().trim()
+  return state.typing ? '' : state.draft.getText().trim()
 }
 
 function multiAnswer(checked: boolean[], text = ''): MultiAnswer {
@@ -184,7 +185,7 @@ function multiAnswer(checked: boolean[], text = ''): MultiAnswer {
 
 /** Text in the field under the highlight that Enter has not confirmed as it stands. */
 function unconfirmedText(state: QuestionState | undefined): boolean {
-  const text = state?.draft.getValue().trim()
+  const text = state?.draft.getText().trim()
   if (!state?.typing || !text) return false
   return state.mode === 'multi' || state.confirmed?.kind !== 'text' || state.confirmed.text !== text
 }
@@ -199,7 +200,7 @@ function confirm(state: QuestionState, answer: Answer): void {
 /** A confirmed multiSelect follows every toggle and keystroke. As in Claude Code, a confirmed
  * single-select text answer changes only when Enter confirms the edited text. */
 function followEdits(state: QuestionState): void {
-  if (state.mode === 'multi' && state.confirmed) state.confirmed = multiAnswer(state.checked, state.draft.getValue().trim())
+  if (state.mode === 'multi' && state.confirmed) state.confirmed = multiAnswer(state.checked, state.draft.getText().trim())
 }
 
 function toggleChecked(state: QuestionState): void {
@@ -227,13 +228,13 @@ interface QuestionView {
   question: string
   header?: string
   state: QuestionState
-  field: string
+  field: string[]
   theme: Theme
 }
 
 /** The top border, question and rows; the caller adds the tab bar and footer. */
 function buildQuestionLines(view: QuestionView): string[] {
-  const { width, question, header, state, field, theme } = view
+  const { width, question, header, state, theme } = view
   const lines: string[] = []
   const add = (s: string) => lines.push(truncateToWidth(s, width))
 
@@ -250,34 +251,49 @@ function buildQuestionLines(view: QuestionView): string[] {
   wrapIndented(question, 1, 'text')
   lines.push('')
 
-  const box = (checked: boolean) => (state.mode === 'multi' ? checkbox(checked, theme) : '')
-  const confirmed = state.mode === 'single' ? state.confirmed : undefined
   state.rows.forEach((row, i) => {
-    const selected = i === state.cursor
-    switch (row.kind) {
-      case 'option':
-        add(optionLine(row.option.label, i, selected, theme, { box: box(state.mode === 'multi' && state.checked[row.index]), confirmed: confirmed?.kind === 'option' && confirmed.index === row.index, width }))
-        if (row.option.description) wrapIndented(row.option.description, 5, 'muted')
-        return
-      case 'text':
-        // A multiSelect free-text row is checked exactly when it has text; Space never toggles it.
-        // As in Claude Code, a confirmed text answer keeps its tick while the field is edited.
-        add(optionLine('', i, selected, theme, { field, box: box(state.draft.getValue().trim() !== ''), confirmed: confirmed?.kind === 'text', width }))
-        return
-      case 'chat':
-        add(theme.fg('dim', '─'.repeat(width)))
-        add(optionLine('Chat about this', i, selected, theme))
-        return
-      default:
-        unreachable(row)
-    }
+    for (const line of rowLines(view, row, i)) add(line)
   })
   return lines
 }
 
-function navHint(multiSelect: boolean, tabs: boolean): string {
+/** A row's lines before truncation: an option's description wraps under its label, and the free-text field's lines after the first under its text. */
+function rowLines(view: QuestionView, row: Row, i: number): string[] {
+  const { width, state, field, theme } = view
+  const selected = i === state.cursor
+  const box = (checked: boolean) => (state.mode === 'multi' ? checkbox(checked, theme) : '')
+  const confirmed = state.mode === 'single' ? state.confirmed : undefined
+  switch (row.kind) {
+    case 'option': {
+      const line = optionLine(row.option.label, i, selected, theme, { box: box(state.mode === 'multi' && state.checked[row.index]), confirmed: confirmed?.kind === 'option' && confirmed.index === row.index, width })
+      if (!row.option.description) return [line]
+      // Leave at least one column for text when the terminal is narrower than the indent.
+      const pad = ' '.repeat(Math.max(0, Math.min(5, width - 1)))
+      return [line, ...wrapTextWithAnsi(row.option.description.trimEnd(), Math.max(1, width - pad.length)).map((part) => pad + theme.fg('muted', part))]
+    }
+    case 'text': {
+      // A multiSelect free-text row is checked exactly when it has text; Space never toggles it.
+      // As in Claude Code, a confirmed text answer keeps its tick while the field is edited.
+      const pad = ' '.repeat(textIndent(state))
+      return [optionLine('', i, selected, theme, { field: field[0], box: box(state.draft.getText().trim() !== ''), confirmed: confirmed?.kind === 'text', width }), ...field.slice(1).map((line) => pad + line)]
+    }
+    case 'chat':
+      return [theme.fg('dim', '─'.repeat(width)), optionLine('Chat about this', i, selected, theme)]
+    default:
+      return unreachable(row)
+  }
+}
+
+/** The columns before the free-text row's text: the cursor and number, and a multiSelect checkbox. */
+function textIndent(state: QuestionState): number {
+  return state.mode === 'multi' ? 9 : 5
+}
+
+/** While text is typed the external editor is offered, as in Claude Code, and Space types rather than toggles. */
+function navHint(multiSelect: boolean, tabs: boolean, typing: boolean): string {
   // The longest variant, a multiSelect question in a batch, is exactly 80 columns.
   const move = tabs ? 'Tab/Arrow keys to navigate' : '↑/↓ to navigate'
+  if (typing) return multiSelect ? ` ${move} · Enter to confirm · Ctrl+G to edit · Esc to cancel` : ` Enter to select · ${move} · Ctrl+G to edit · Esc to cancel`
   return multiSelect ? ` Space to toggle · ${move} · Enter to confirm · Esc to cancel` : ` Enter to select · ${move} · Esc to cancel`
 }
 
@@ -702,9 +718,14 @@ export async function askViaOverlay(specs: QuestionSpec[], ctx: ExtensionContext
     if (saved.every(Boolean)) return { kind: 'submit', answers: saved }
     let active = saved.indexOf(undefined)
 
-    return await ctx.ui.custom<FormResult | null>((tui, theme, _kb, done) => {
+    return await ctx.ui.custom<FormResult | null>((tui, theme, keybindings, done) => {
+      const editorTheme = {
+        borderColor: (text: string) => theme.fg('dim', text),
+        selectList: { selectedPrefix: (text: string) => theme.fg('accent', text), selectedText: (text: string) => theme.fg('accent', text), description: (text: string) => theme.fg('muted', text), scrollInfo: (text: string) => theme.fg('dim', text), noMatch: (text: string) => theme.fg('dim', text) },
+      }
+      let editing = false
       const states = specs.map((spec): QuestionState => {
-        const common = { rows: questionRows(spec), cursor: 0, typing: false, draft: new Input({ prompt: '', placeholder: textRowLabel(spec.multiSelect), placeholderStyle: (text) => theme.fg('dim', text) }) }
+        const common = { rows: questionRows(spec), cursor: 0, typing: false, draft: new Editor(tui, editorTheme) }
         return spec.multiSelect ? { ...common, mode: 'multi', checked: spec.options.map(() => false) } : { ...common, mode: 'single' }
       })
       saved.forEach((value, index) => {
@@ -756,7 +777,7 @@ export async function askViaOverlay(specs: QuestionSpec[], ctx: ExtensionContext
       function timeoutAnswer(state: QuestionState): Outcome {
         const confirmed = confirmedAnswer(state)
         if (confirmed) return confirmed
-        return state.mode === 'multi' ? { kind: 'timedOut', selected: multiAnswer(state.checked, state.draft.getValue().trim()) } : { kind: 'timedOut' }
+        return state.mode === 'multi' ? { kind: 'timedOut', selected: multiAnswer(state.checked, state.draft.getText().trim()) } : { kind: 'timedOut' }
       }
       function restoreRemoteAnswer(index: number, value: Answer): void {
         const state = states[index]
@@ -765,10 +786,10 @@ export async function askViaOverlay(specs: QuestionSpec[], ctx: ExtensionContext
         switch (value.kind) {
           case 'multi':
             if (state.mode === 'multi') state.checked = state.checked.map((_, option) => value.indices.includes(option))
-            state.draft.setValue(value.text ?? '')
+            state.draft.setText(value.text ?? '')
             return
           case 'text':
-            state.draft.setValue(value.text)
+            state.draft.setText(value.text)
             return
           case 'option':
             return
@@ -833,7 +854,7 @@ export async function askViaOverlay(specs: QuestionSpec[], ctx: ExtensionContext
         else confirmRow(state, row)
       }
       function confirmChecked(state: Extract<QuestionState, { mode: 'multi' }>): void {
-        const answer = multiAnswer(state.checked, state.draft.getValue().trim())
+        const answer = multiAnswer(state.checked, state.draft.getText().trim())
         if (answer.indices.length > 0 || answer.text) commit(answer)
         else if (!lone) {
           // Nothing filled in leaves the question unanswered; a lone question has nowhere to advance.
@@ -844,7 +865,7 @@ export async function askViaOverlay(specs: QuestionSpec[], ctx: ExtensionContext
       function confirmRow(state: QuestionState, row: Exclude<Row, { kind: 'chat' }>): void {
         switch (row.kind) {
           case 'text': {
-            const text = state.draft.getValue().trim()
+            const text = state.draft.getText().trim()
             if (text) commit({ kind: 'text', text })
             return
           }
@@ -863,12 +884,28 @@ export async function askViaOverlay(specs: QuestionSpec[], ctx: ExtensionContext
         refresh()
         return true
       }
+      async function editExternally(state: QuestionState): Promise<void> {
+        editing = true
+        try {
+          const text = await editTextExternally(tui, externalEditorCommand(ctx.cwd), state.draft.getText())
+          if (text === undefined || finished) return
+          state.draft.setText(text)
+          followEdits(state)
+        } finally {
+          editing = false
+          refresh()
+        }
+      }
+      function confirmTyped(state: QuestionState): void {
+        if (state.mode === 'single' && !state.draft.getText().trim()) finish(null)
+        else confirmSelection(state)
+      }
       function handleTypingInput(state: QuestionState, data: string): void {
-        if (matchesKey(data, Key.escape)) finish(null)
-        else if (matchesKey(data, Key.enter)) {
-          if (state.mode === 'single' && !state.draft.getValue().trim()) finish(null)
-          else confirmSelection(state)
-        } else if (!matchesKey(data, Key.tab) && !matchesKey(data, Key.shift('tab'))) {
+        if (keybindings.matches(data, 'app.editor.external')) void editExternally(state)
+        else if (matchesKey(data, Key.escape)) finish(null)
+        // Ctrl+J, one of pi's newline keys, also reads as Enter.
+        else if (matchesKey(data, Key.enter) && !keybindings.matches(data, 'tui.input.newLine')) confirmTyped(state)
+        else if (!matchesKey(data, Key.tab) && !matchesKey(data, Key.shift('tab'))) {
           state.draft.handleInput(data)
           followEdits(state)
         }
@@ -900,7 +937,7 @@ export async function askViaOverlay(specs: QuestionSpec[], ctx: ExtensionContext
         refresh()
       }
       function handleInput(data: string): void {
-        if (finished) return
+        if (finished || editing) return
         resetIdleTimer()
         if (!lone && navigateWithKey(data)) return
         const state = states[active]
@@ -908,15 +945,21 @@ export async function askViaOverlay(specs: QuestionSpec[], ctx: ExtensionContext
         else handleReviewInput(data)
       }
 
-      function textField(state: QuestionState, width: number): string {
-        const draft = state.draft.getValue()
+      /** The free-text row's lines; the first sits on the row, the rest under its text. */
+      function textField(state: QuestionState, width: number): string[] {
+        const draft = state.draft.getText()
+        // A confirmed text answer's tick takes two more columns after the text.
+        const room = Math.max(1, width - textIndent(state) - (state.mode === 'single' && state.confirmed?.kind === 'text' ? 2 : 0))
+        const placeholder = textRowLabel(state.mode === 'multi')
         state.draft.focused = state.typing
-        // The row's prefix and number take five columns, a checkbox four more, a confirmed tick two.
-        let reserved = 5
-        if (state.mode === 'multi') reserved = 9
-        else if (state.confirmed?.kind === 'text') reserved = 7
-        if (state.typing) return state.draft.render(Math.max(1, width - reserved))[0].trimEnd()
-        return draft ? theme.fg('text', draft) : theme.fg('dim', textRowLabel(state.mode === 'multi'))
+        if (state.typing && !draft) return [CURSOR_MARKER + renderFakeCursor(theme.fg('dim', placeholder[0])) + theme.fg('dim', placeholder.slice(1))]
+        // pi's Editor draws a rule above and below its lines.
+        if (state.typing)
+          return state.draft
+            .render(room)
+            .slice(1, -1)
+            .map((line) => line.trimEnd())
+        return draft ? draft.split('\n').flatMap((line) => wrapTextWithAnsi(line, room).map((part) => theme.fg('text', part))) : [theme.fg('dim', placeholder)]
       }
       function renderTabs(width: number, saved: Array<Answer | undefined>): string {
         const tabs = specs.map((spec, index) => {
@@ -956,7 +999,7 @@ export async function askViaOverlay(specs: QuestionSpec[], ctx: ExtensionContext
         const saved = answers()
         const rule = theme.fg('accent', '─'.repeat(width))
         const lines = state ? buildQuestionLines({ width, question: theme.bold(spec.question), header: lone ? spec.header : undefined, state, field: textField(state, width), theme }) : [rule, ...reviewBody(width, saved)]
-        lines.push('', theme.fg('dim', navHint(spec?.multiSelect === true, !lone)))
+        lines.push('', theme.fg('dim', navHint(spec?.multiSelect === true, !lone, state?.typing === true)))
         if (countdown !== undefined) lines.push(theme.fg('warning', ` Auto-continuing in ${countdown}s if idle · press any key to stay`))
         lines.push(rule)
         // The tab bar sits inside the frame, under its top border.

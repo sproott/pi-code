@@ -9,6 +9,13 @@ import { setCliSettingsReader } from '../extensions/internal/cli-settings.ts'
 import { setManagedSettingsPath } from '../extensions/internal/managed-settings.ts'
 import questionExtension, { askUserQuestionTimeoutMs, askViaOverlay, parseAskUserQuestionTimeout, QuestionParams, REMOTE_QUESTION_CHANNEL, type RemoteQuestionOffer, shortHeader } from '../extensions/question.ts'
 
+const editTextExternally = vi.hoisted(() => vi.fn<(tui: unknown, command: string, text: string) => Promise<string | undefined>>())
+vi.mock('../extensions/internal/external-editor.ts', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../extensions/internal/external-editor.ts')>()),
+  externalEditorCommand: () => '/usr/bin/vim -f',
+  editTextExternally,
+}))
+
 interface Option {
   label: string
   description?: string
@@ -47,9 +54,11 @@ const theme = { fg: (_color: string, s: string) => s, bg: (_color: string, s: st
 
 /** The overlay only reaches for requestRender. */
 const fakeTui = () => ({ requestRender: () => {}, terminal: { rows: 24 } })
+/** pi's default keybindings as far as the form reads them: Ctrl+G opens the external editor, Shift+Enter and Ctrl+J start a line. */
+const KEYS = { matches: (data: string, id: string) => (id === 'app.editor.external' && data === RAW.ctrlG) || (id === 'tui.input.newLine' && (data === RAW.newline || data === '\n')) }
 
 /** Raw terminal byte sequences, as the host feeds them to handleInput. */
-const RAW = { up: '\x1b[A', down: '\x1b[B', left: '\x1b[D', right: '\x1b[C', tab: '\t', enter: '\r', escape: '\x1b', space: ' ' }
+const RAW = { up: '\x1b[A', down: '\x1b[B', left: '\x1b[D', right: '\x1b[C', tab: '\t', enter: '\r', escape: '\x1b', space: ' ', newline: '\x1b[13;2u', ctrlG: '\x07' }
 
 const setup = (): QuestionTool => {
   let tool: QuestionTool | undefined
@@ -96,7 +105,7 @@ const openOverlay = (tool: QuestionTool, options: Option[] = OPTIONS) => {
     ui: {
       custom: (factory: CustomFactory) =>
         new Promise((resolve) => {
-          overlay = factory(fakeTui(), theme, {}, resolve)
+          overlay = factory(fakeTui(), theme, KEYS, resolve)
         }),
     },
   }
@@ -115,7 +124,7 @@ const openOverlayWith = (tool: QuestionTool, params: Record<string, unknown>, ov
     ui: {
       custom: (factory: CustomFactory) =>
         new Promise((resolve) => {
-          overlay = factory(fakeTui(), overlayTheme, {}, resolve)
+          overlay = factory(fakeTui(), overlayTheme, KEYS, resolve)
         }),
     },
   }
@@ -230,7 +239,7 @@ describe('question remote offer', () => {
     const custom = vi.fn(
       (factory: CustomFactory) =>
         new Promise((resolve) => {
-          overlay = factory(fakeTui(), theme, {}, resolve)
+          overlay = factory(fakeTui(), theme, KEYS, resolve)
         }),
     )
     return { custom, input: (data: string) => overlay?.handleInput(data) }
@@ -870,7 +879,7 @@ describe('question overlay', () => {
   it('should color each wrapped row separately when the theme applies colors', () => {
     let overlay: Overlay | undefined
     const colorTheme = { fg: (_color: string, s: string) => `\x1b[31m${s}\x1b[39m`, bold: (s: string) => s }
-    const ctx = { hasUI: true, mode: 'tui', ui: { custom: (factory: CustomFactory) => new Promise((resolve) => (overlay = factory(fakeTui(), colorTheme, {}, resolve))) } }
+    const ctx = { hasUI: true, mode: 'tui', ui: { custom: (factory: CustomFactory) => new Promise((resolve) => (overlay = factory(fakeTui(), colorTheme, KEYS, resolve))) } }
     void setup().execute('call-1', { question: 'Which deployment target should we use?', options: [{ label: 'Alpha', description: 'Deploy to the production cluster' }, { label: 'Beta' }] }, undefined, undefined, ctx)
     if (!overlay) throw new Error('ui.custom factory was never invoked')
 
@@ -1014,14 +1023,14 @@ describe('question overlay', () => {
     for (let i = 0; i < 2; i++) overlay.handleInput(RAW.down)
     const empty = overlay.render(60).map(stripTerminalSequences)
     overlay.handleInput('hi')
-    const typed = overlay.render(60).map(stripTerminalSequences)
+    const typed = overlay.render(80).map(stripTerminalSequences)
     overlay.handleInput(RAW.enter)
     const submitted = await result
 
     expect(empty, 'The empty row should show the placeholder').toContain('❯ 3. Type something.')
     expect(typed.join('\n'), 'The draft should appear inline in the row').toContain('❯ 3. hi')
     expect(typed, 'There should be no separate answer editor').not.toContain(' Your answer:')
-    expect(typed, 'The hint should not change while typing, as in Claude Code').toContain(' Enter to select · ↑/↓ to navigate · Esc to cancel')
+    expect(typed, 'The hint should offer the external editor while typing, as in Claude Code').toContain(' Enter to select · ↑/↓ to navigate · Ctrl+G to edit · Esc to cancel')
     expect(submitted.content[0].text, 'Enter should confirm the typed text').toBe('User wrote: hi')
   })
 
@@ -1103,10 +1112,86 @@ describe('question header and multiSelect', () => {
   it('should show the header as a highlighted chip under the border and the question in bold', () => {
     const marked = { fg: (_color: string, s: string) => s, bg: (color: string, s: string) => `<${color}>${s}</${color}>`, bold: (s: string) => `*${s}*` }
     let overlay: Overlay | undefined
-    const ctx = { hasUI: true, mode: 'tui', ui: { custom: (factory: CustomFactory) => new Promise(() => (overlay = factory(fakeTui(), marked, {}, () => {}))) } }
+    const ctx = { hasUI: true, mode: 'tui', ui: { custom: (factory: CustomFactory) => new Promise(() => (overlay = factory(fakeTui(), marked, KEYS, () => {}))) } }
     void setup().execute('call-1', multiParams as never, undefined, undefined, ctx)
     const out = overlay?.render(80) ?? []
     expect(out.slice(1, 4)).toEqual(['<selectedBg> ☐ Scope </selectedBg>', '', ' *Pick some*'])
+  })
+
+  it('should put each typed line under the text when Shift+Enter breaks the free text', async () => {
+    const { overlay, result } = openOverlay(setup())
+    overlay.handleInput(RAW.down)
+    overlay.handleInput(RAW.down)
+    overlay.handleInput('one')
+    overlay.handleInput(RAW.newline)
+    overlay.handleInput('two')
+    const typing = overlay.render(80).map(stripTerminalSequences)
+    overlay.handleInput(RAW.down)
+    const settled = overlay.render(80).map(stripTerminalSequences)
+    overlay.handleInput(RAW.up)
+    overlay.handleInput(RAW.enter)
+
+    expect(typing.join('\n'), "The second line should sit under the first one's text while typing").toContain('❯ 3. one\n     two')
+    expect(settled.join('\n'), 'The second line should stay under the text once typing stops').toContain('  3. one\n     two')
+    expect((await result).content[0].text, 'Enter should send both lines').toBe('User wrote: one\ntwo')
+  })
+
+  it('should start a new line when Ctrl+J is pressed in the free text', () => {
+    const { overlay } = openOverlay(setup())
+    overlay.handleInput(RAW.down)
+    overlay.handleInput(RAW.down)
+    overlay.handleInput('one')
+    overlay.handleInput('\n')
+    overlay.handleInput('two')
+
+    expect(overlay.render(80).map(stripTerminalSequences).join('\n'), "Ctrl+J should break the line, as pi's newline key").toContain('❯ 3. one\n     two')
+  })
+
+  it('should leave the row on Up and walk the lines with Left when the free text has several lines', () => {
+    const { overlay } = openOverlay(setup())
+    overlay.handleInput(RAW.down)
+    overlay.handleInput(RAW.down)
+    overlay.handleInput('one')
+    overlay.handleInput(RAW.newline)
+    overlay.handleInput('two')
+    overlay.handleInput(RAW.left)
+    overlay.handleInput(RAW.left)
+    overlay.handleInput(RAW.left)
+    overlay.handleInput(RAW.left)
+    overlay.handleInput('!')
+    const afterLeft = overlay.render(80).map(stripTerminalSequences)
+    overlay.handleInput(RAW.up)
+    const afterUp = overlay.render(80).map(stripTerminalSequences)
+
+    expect(afterLeft.join('\n'), 'Left from the start of a line should reach the end of the line above').toContain('❯ 3. one!')
+    expect(afterUp, 'Up should leave the row from any line, as in Claude Code').toContain('❯ 2. Beta')
+  })
+
+  it("should replace the free text with the external editor's text when Ctrl+G is pressed", async () => {
+    editTextExternally.mockResolvedValueOnce('from\neditor')
+    const { overlay, result } = openOverlay(setup())
+    overlay.handleInput(RAW.down)
+    overlay.handleInput(RAW.down)
+    overlay.handleInput('draft')
+    overlay.handleInput(RAW.ctrlG)
+    await vi.waitFor(() => expect(overlay.render(80).map(stripTerminalSequences).join('\n')).toContain('3. from\n     editor'))
+    overlay.handleInput(RAW.enter)
+
+    expect(editTextExternally, "The editor should open on the draft with pi's editor command").toHaveBeenCalledWith(expect.anything(), '/usr/bin/vim -f', 'draft')
+    expect((await result).content[0].text, 'Enter should send the edited text').toBe('User wrote: from\neditor')
+  })
+
+  it('should keep the free text when the external editor fails', async () => {
+    editTextExternally.mockResolvedValueOnce(undefined)
+    const { overlay, result } = openOverlay(setup())
+    overlay.handleInput(RAW.down)
+    overlay.handleInput(RAW.down)
+    overlay.handleInput('draft')
+    overlay.handleInput(RAW.ctrlG)
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    overlay.handleInput(RAW.enter)
+
+    expect((await result).content[0].text, 'The typed text should survive a failed edit').toBe('User wrote: draft')
   })
 
   it('should type a space instead of toggling when Space is pressed in the multi-select free-text row', () => {
@@ -1119,7 +1204,7 @@ describe('question header and multiSelect', () => {
     const out = overlay.render(80).map(stripTerminalSequences)
 
     expect(out.join('\n'), 'Space should type into the row').toContain('❯ 3. [✔] a b')
-    expect(out, 'The hint should not change while typing').toContain(' Space to toggle · ↑/↓ to navigate · Enter to confirm · Esc to cancel')
+    expect(out, 'The hint should drop Space and offer the external editor while typing').toContain(' ↑/↓ to navigate · Enter to confirm · Ctrl+G to edit · Esc to cancel')
     expect(out, 'No other option should be toggled').toEqual(expect.arrayContaining(['  1. [ ] Alpha', '  2. [ ] Beta']))
   })
 
@@ -1532,16 +1617,17 @@ describe('question navigation hints', () => {
       return overlay.render(200).at(-2) ?? ''
     }
 
-    const hints = [hint(single), hint(multi), hint(single, typing), hint(pair), hint({ questions: [multi, single] }), hint(pair, typing), hint(pair, [RAW.right, RAW.right])]
+    const hints = [hint(single), hint(multi), hint(single, typing), hint(pair), hint({ questions: [multi, single] }), hint(pair, typing), hint(pair, [RAW.right, RAW.right]), hint({ questions: [multi, single] }, [RAW.down, RAW.down])]
 
     expect(hints, 'Each form state should show its own keys').toEqual([
       ' Enter to select · ↑/↓ to navigate · Esc to cancel',
       ' Space to toggle · ↑/↓ to navigate · Enter to confirm · Esc to cancel',
-      ' Enter to select · ↑/↓ to navigate · Esc to cancel',
+      ' Enter to select · ↑/↓ to navigate · Ctrl+G to edit · Esc to cancel',
       ' Enter to select · Tab/Arrow keys to navigate · Esc to cancel',
       ' Space to toggle · Tab/Arrow keys to navigate · Enter to confirm · Esc to cancel',
+      ' Enter to select · Tab/Arrow keys to navigate · Ctrl+G to edit · Esc to cancel',
       ' Enter to select · Tab/Arrow keys to navigate · Esc to cancel',
-      ' Enter to select · Tab/Arrow keys to navigate · Esc to cancel',
+      ' Tab/Arrow keys to navigate · Enter to confirm · Ctrl+G to edit · Esc to cancel',
     ])
     for (const text of hints) expect(visibleWidth(text), `"${text}" should fit an 80 column terminal`).toBeLessThanOrEqual(80)
   })
@@ -2167,7 +2253,7 @@ describe('question batch lifecycle', () => {
       sessionManager: { getSessionId: () => 'session-1' },
       ui: {
         custom: async (factory: CustomFactory) => {
-          overlay = factory(fakeTui(), theme, {}, () => {})
+          overlay = factory(fakeTui(), theme, KEYS, () => {})
           throw new Error('Overlay failed')
         },
       },
@@ -2836,7 +2922,7 @@ describe('question batch lifecycle', () => {
       ui: {
         custom: (factory: CustomFactory) =>
           new Promise((resolve) => {
-            overlay = factory(fakeTui(), theme, {}, resolve)
+            overlay = factory(fakeTui(), theme, KEYS, resolve)
           }),
       },
     }
@@ -3059,7 +3145,7 @@ describe('askViaOverlay idle timeout', () => {
       ui: {
         custom: (factory: CustomFactory) =>
           new Promise((resolve) => {
-            overlay = factory(fakeTui(), theme, {}, resolve)
+            overlay = factory(fakeTui(), theme, KEYS, resolve)
           }),
       },
     }
