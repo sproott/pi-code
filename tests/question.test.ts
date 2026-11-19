@@ -1,9 +1,9 @@
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { createEventBus } from '@earendil-works/pi-coding-agent'
+import { createEventBus, initTheme } from '@earendil-works/pi-coding-agent'
 import { stripTerminalSequences, type Text, visibleWidth } from '@earendil-works/pi-tui'
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { setCliSettingsReader } from '../extensions/internal/cli-settings.ts'
 import { setManagedSettingsPath } from '../extensions/internal/managed-settings.ts'
@@ -19,6 +19,7 @@ vi.mock('../extensions/internal/external-editor.ts', async (importOriginal) => (
 interface Option {
   label: string
   description?: string
+  preview?: string
 }
 interface Details {
   question: string
@@ -3224,5 +3225,493 @@ describe('askViaOverlay idle timeout', () => {
     // is the only oracle that actually distinguishes the two.
     overlay.handleInput(RAW.enter) // resolves via the normal Enter path, not the timeout
     expect(vi.getTimerCount()).toBe(0)
+  })
+})
+
+describe('question option previews', () => {
+  const PREVIEWED: Option[] = [
+    { label: 'Sidebar', description: 'Nav on the left', preview: 'SIDEBAR MOCK' },
+    { label: 'Plain', description: 'No preview here' },
+  ]
+  const TALL = Array.from({ length: 60 }, (_, i) => `row ${i + 1}`).join('\n')
+
+  beforeAll(() => {
+    initTheme()
+  })
+
+  /** The overlay on a terminal of `rows` rows, so the preview height can be checked. */
+  const openPreview = (params: Record<string, unknown>, rows = 50) => {
+    let overlay: Overlay | undefined
+    const ctx = {
+      hasUI: true,
+      mode: 'tui',
+      sessionManager: { getSessionId: () => 'session-1' },
+      ui: {
+        custom: (factory: CustomFactory) =>
+          new Promise((resolve) => {
+            overlay = factory({ requestRender: () => {}, terminal: { rows } }, theme, KEYS, resolve)
+          }),
+      },
+    }
+    const result = setup().execute('call-1', params as never, undefined, undefined, ctx)
+    if (!overlay) throw new Error('ui.custom factory was never invoked')
+    const screen = (width = 100) => (overlay as Overlay).render(width).map((line) => stripTerminalSequences(line).trimEnd())
+    return { overlay, result, screen }
+  }
+  const single = (options: Option[] = PREVIEWED) => ({ question: 'Which layout?', options })
+  const batch = (options: Option[] = PREVIEWED) => ({
+    questions: [
+      { question: 'Which layout?', header: 'Layout', options },
+      { question: 'Which color?', header: 'Color', options },
+    ],
+  })
+  const type = (overlay: Overlay, text: string) => {
+    for (const char of text) overlay.handleInput(char)
+  }
+
+  it('should accept a preview string on an option when the schema is read', () => {
+    const schema = QuestionParams as unknown as { properties: { options: { items: { properties: Record<string, { type: string }> } } } }
+
+    expect(schema.properties.options.items.properties.preview?.type, 'An option should take an optional preview string').toBe('string')
+  })
+
+  it("should show the focused option's preview in a box beside the options when an option has a preview", () => {
+    const { screen } = openPreview(single())
+
+    const row = screen().find((line) => line.startsWith('❯ 1. Sidebar'))
+
+    expect(row, 'The preview box should start at column 34 on the focused option row').toBe(`❯ 1. Sidebar${' '.repeat(22)}┌${'─'.repeat(42)}┐`)
+    expect(screen(), 'The box should hold the preview').toContain(`  2. Plain${' '.repeat(24)}│ SIDEBAR MOCK${' '.repeat(29)}│`)
+  })
+
+  it('should leave out descriptions and the free-text row when the question shows previews', () => {
+    const { screen } = openPreview(single())
+
+    const text = screen().join('\n')
+
+    expect(text, 'Descriptions should not be shown').not.toContain('Nav on the left')
+    expect(text, 'The free-text row should not be offered').not.toContain('Type something')
+  })
+
+  it('should keep the list layout when a multiSelect question has previews', () => {
+    const { screen } = openPreview({ ...single(), multiSelect: true })
+
+    const text = screen().join('\n')
+
+    expect(text, 'A multiSelect question should ignore previews').not.toContain('SIDEBAR MOCK')
+    expect(text, 'A multiSelect question should keep its free-text row').toContain('Type something')
+  })
+
+  it('should show No preview available when the focused option has no preview', () => {
+    const { overlay, screen } = openPreview(single())
+    overlay.handleInput(RAW.down)
+
+    expect(screen().join('\n'), 'An option without a preview should say so in the box').toContain('│ No preview available')
+  })
+
+  it('should show No preview available when the focused option has a blank preview', () => {
+    const { screen } = openPreview(single([{ label: 'Blank', preview: '  ' }, { label: 'Other' }]))
+
+    expect(screen().join('\n'), 'A blank preview should read as none').toContain('│ No preview available')
+  })
+
+  it('should widen the box to the widest preview of the question when it exceeds the minimum', () => {
+    const { screen } = openPreview(
+      single([
+        { label: 'Short', preview: 'x' },
+        { label: 'Wide', preview: 'w'.repeat(50) },
+      ]),
+    )
+
+    const top = screen().find((line) => line.includes('┌')) ?? ''
+
+    expect(visibleWidth(top.slice(top.indexOf('┌'))), 'The box should fit the widest preview of any option plus its border and margin').toBe(54)
+  })
+
+  it('should cap the box at the right edge when the widest preview is wider than the terminal', () => {
+    const { screen } = openPreview(single([{ label: 'Wide', preview: 'w'.repeat(200) }, { label: 'Other' }]))
+
+    const top = screen(80).find((line) => line.includes('┌')) ?? ''
+
+    expect(top.indexOf('┌') + visibleWidth(top.slice(top.indexOf('┌'))), 'The box should end at the right edge').toBe(80)
+    expect(top.endsWith('┐'), 'The box should close inside the terminal').toBe(true)
+  })
+
+  it('should cut a tall preview to the terminal rows less 26 when it does not fit', () => {
+    const { screen } = openPreview(single([{ label: 'Tall', preview: TALL }, { label: 'Other' }]), 40)
+
+    const text = screen()
+
+    expect(text.filter((line) => /│ row \d+/.test(line)).length, 'A 40-row terminal should show 14 preview lines').toBe(14)
+    expect(text.join('\n'), 'The cut should count the hidden lines').toContain('├─── ✂ ─── 46 lines hidden ───')
+  })
+
+  it('should show one preview line when the terminal is shorter than 27 rows', () => {
+    const { screen } = openPreview(single([{ label: 'Tall', preview: TALL }, { label: 'Other' }]), 20)
+
+    expect(screen().filter((line) => /│ row \d+/.test(line)).length, 'At least one preview line should remain').toBe(1)
+  })
+
+  it('should render the preview as Markdown when it uses Markdown syntax', () => {
+    const { screen } = openPreview(single([{ label: 'Md', preview: '# Heading\n\n**bold** text' }, { label: 'Other' }]))
+
+    const text = screen().join('\n')
+
+    expect(text, 'The heading marker should be rendered away').toMatch(/│ Heading/)
+    expect(text, 'Emphasis markers should be rendered away').toContain('│ bold text')
+  })
+
+  it('should put the box below the options when the terminal leaves less than 20 columns beside them', () => {
+    const { screen } = openPreview(single())
+
+    const text = screen(50)
+    const options = text.findIndex((line) => line.startsWith('  2. Plain'))
+
+    expect(text[options + 2], 'The box should follow the options after a blank line, at full width').toBe(`┌${'─'.repeat(48)}┐`)
+  })
+
+  it("should keep the last option's preview and pointer when the Chat row is focused", () => {
+    const { overlay, screen } = openPreview(
+      single([
+        { label: 'One', preview: 'ONE' },
+        { label: 'Two', preview: 'TWO' },
+      ]),
+    )
+    overlay.handleInput(RAW.down)
+    overlay.handleInput(RAW.down)
+
+    const text = screen()
+
+    expect(text.join('\n'), 'The last option should keep its preview').toContain('│ TWO')
+    expect(
+      text.some((line) => line.startsWith('❯ 2. Two')),
+      'The last option should keep its pointer',
+    ).toBe(true)
+    expect(text, 'The Chat row should be focused, without a number').toContain('❯ Chat about this')
+  })
+
+  it('should move the focus to an option without choosing it when its digit is pressed', () => {
+    const { overlay, result, screen } = openPreview(single())
+    overlay.handleInput('2')
+
+    expect(
+      screen().some((line) => line.startsWith('❯ 2. Plain')),
+      'The digit should move the focus',
+    ).toBe(true)
+    overlay.handleInput(RAW.escape)
+    return expect(result, 'The digit should not have answered the question').resolves.toMatchObject({ content: [{ text: 'User cancelled the selection' }] })
+  })
+
+  it('should mark the chosen option with a check when returning to an answered question', () => {
+    const { overlay, screen } = openPreview(batch())
+    overlay.handleInput(RAW.enter)
+    overlay.handleInput(RAW.left)
+
+    expect(
+      screen().some((line) => line.startsWith('❯ 1. Sidebar ✔')),
+      'The confirmed option should carry a check',
+    ).toBe(true)
+  })
+
+  it('should wrap the hint when it is wider than the terminal', () => {
+    const { screen } = openPreview(batch())
+
+    const text = screen(80)
+
+    expect(text, 'The hint should wrap at a word boundary').toContain(' Enter to select · ↑/↓ to navigate · n to add notes · Tab to switch questions ·')
+    expect(text, 'The rest of the hint should follow on the next line').toContain('Esc to cancel')
+  })
+
+  it('should show the notes placeholder under the box when no notes are typed', () => {
+    const { screen } = openPreview(single())
+
+    expect(screen(), 'The notes field should be aligned with the box').toContain(`${' '.repeat(34)}Notes: press n to add notes`)
+  })
+
+  it('should open the notes when n is pressed on an option', () => {
+    const { overlay, screen } = openPreview(single())
+    overlay.handleInput('n')
+
+    const text = screen().join('\n')
+
+    expect(text, 'Open notes should invite typing').toContain('Notes: Add notes on this design…')
+    expect(text, 'The hint should offer the external editor').toContain('Ctrl+G to edit')
+  })
+
+  it('should not open the notes when n is pressed on the Chat row', () => {
+    const { overlay, screen } = openPreview(single())
+    overlay.handleInput(RAW.down)
+    overlay.handleInput(RAW.down)
+    overlay.handleInput('n')
+
+    expect(screen().join('\n'), 'n on the Chat row should leave the notes closed').toContain('Notes: press n to add notes')
+  })
+
+  it('should keep the focus on the option when Down is pressed in open notes', () => {
+    const { overlay, screen } = openPreview(single())
+    overlay.handleInput('n')
+    overlay.handleInput(RAW.down)
+
+    expect(
+      screen().some((line) => line.startsWith('❯ 1. Sidebar')),
+      'Down should stay in the notes',
+    ).toBe(true)
+  })
+
+  it('should stay on the question when Tab is pressed in open notes', () => {
+    const { overlay, screen } = openPreview(batch())
+    overlay.handleInput('n')
+    overlay.handleInput(RAW.tab)
+
+    expect(screen().join('\n'), 'Tab should not switch questions while notes are open').toContain('Which layout?')
+  })
+
+  it('should close the notes and keep their text when Esc is pressed in them', () => {
+    const { overlay, screen } = openPreview(single())
+    overlay.handleInput('n')
+    type(overlay, 'keep me')
+    overlay.handleInput(RAW.escape)
+
+    const text = screen().join('\n')
+
+    expect(text, 'The notes should keep their text').toContain('Notes: keep me')
+    expect(text, 'The hint should be back to the closed form').not.toContain('Ctrl+G to edit')
+  })
+
+  it('should start a new notes line when Ctrl+J is pressed in them', () => {
+    const { overlay, screen } = openPreview(single())
+    overlay.handleInput('n')
+    type(overlay, 'one')
+    overlay.handleInput('\n')
+    type(overlay, 'two')
+
+    const text = screen()
+    const first = text.findIndex((line) => line.endsWith('Notes: one'))
+
+    expect(text[first + 1], 'The second line should sit under the first line of text').toBe(`${' '.repeat(41)}two`)
+  })
+
+  /** Types `hello`, moves the cursor two left, runs `between`, reopens the notes and types X. */
+  const reopenAfter = (params: Record<string, unknown>, between: (overlay: Overlay) => void) => {
+    const { overlay, screen } = openPreview(params)
+    overlay.handleInput('n')
+    type(overlay, 'hello')
+    overlay.handleInput(RAW.left)
+    overlay.handleInput(RAW.left)
+    between(overlay)
+    overlay.handleInput('n')
+    overlay.handleInput('X')
+    return screen().join('\n')
+  }
+
+  it('should keep the notes cursor where it was left when the notes are reopened after Esc', () => {
+    const text = reopenAfter(single(), (overlay) => overlay.handleInput(RAW.escape))
+
+    expect(text, 'X should land where the cursor was left').toContain('Notes: helXlo')
+  })
+
+  it('should keep the notes cursor on the line it was moved to when multi-line notes are reopened', () => {
+    const { overlay, screen } = openPreview(single())
+    overlay.handleInput('n')
+    type(overlay, 'one')
+    overlay.handleInput('\n')
+    type(overlay, 'two')
+    overlay.handleInput(RAW.up)
+    overlay.handleInput(RAW.escape)
+    overlay.handleInput('n')
+    overlay.handleInput('X')
+
+    expect(screen().join('\n'), 'X should land at the end of the first line').toContain(`Notes: oneX\n${' '.repeat(41)}two`)
+  })
+
+  it('should keep the notes cursor when the option focus moves before the notes are reopened', () => {
+    const text = reopenAfter(single(), (overlay) => {
+      overlay.handleInput(RAW.escape)
+      overlay.handleInput(RAW.down)
+      overlay.handleInput(RAW.up)
+    })
+
+    expect(text, 'Moving between options should not move the notes cursor').toContain('Notes: helXlo')
+  })
+
+  it('should keep the notes cursor when the form switches to another preview question and back', () => {
+    const text = reopenAfter(batch(), (overlay) => {
+      overlay.handleInput(RAW.escape)
+      overlay.handleInput(RAW.tab)
+      overlay.handleInput('\x1b[Z')
+    })
+
+    expect(text, 'Switching questions should not move the notes cursor').toContain('Notes: helXlo')
+  })
+
+  it('should keep the notes cursor when an option is chosen and the form comes back to the question', () => {
+    const text = reopenAfter(batch(), (overlay) => {
+      overlay.handleInput(RAW.escape)
+      overlay.handleInput(RAW.enter)
+      overlay.handleInput(RAW.left)
+    })
+
+    expect(text, 'Choosing an option should not move the notes cursor').toContain('Notes: helXlo')
+  })
+
+  it('should keep the notes cursor when Enter confirms the notes and the form comes back to the question', () => {
+    const text = reopenAfter(batch(), (overlay) => {
+      overlay.handleInput(RAW.enter)
+      overlay.handleInput(RAW.left)
+    })
+
+    expect(text, 'Confirming the notes should not move their cursor').toContain('Notes: helXlo')
+  })
+
+  it('should submit the notes alone when Enter is pressed in them with no option chosen', async () => {
+    const { overlay, result } = openPreview(single())
+    overlay.handleInput('n')
+    type(overlay, 'use uuid')
+    overlay.handleInput(RAW.enter)
+
+    expect((await result).content[0].text, 'Notes alone should answer the question').toBe('User selected: (no option selected)\nUser notes: use uuid')
+  })
+
+  it('should close empty notes without answering when Enter is pressed in them', async () => {
+    const { overlay, result, screen } = openPreview(single())
+    overlay.handleInput('n')
+    overlay.handleInput(RAW.enter)
+
+    expect(screen().join('\n'), 'Empty notes should close').toContain('Notes: press n to add notes')
+    overlay.handleInput(RAW.escape)
+    expect((await result).content[0].text, 'The form should still be open, so Esc cancels it').toBe('User cancelled the selection')
+  })
+
+  it('should send the notes with the option when Enter chooses an option after notes are typed', async () => {
+    const { overlay, result } = openPreview(single())
+    overlay.handleInput('n')
+    type(overlay, 'with nav')
+    overlay.handleInput(RAW.escape)
+    overlay.handleInput(RAW.enter)
+
+    expect((await result).content[0].text, 'The notes should follow the selection and its preview').toBe('User selected: 1. Sidebar\nSelected preview:\nSIDEBAR MOCK\nUser notes: with nav')
+  })
+
+  it('should keep the chosen option when Enter confirms notes on an answered question', async () => {
+    const { overlay, result } = openPreview(batch())
+    overlay.handleInput(RAW.enter)
+    overlay.handleInput(RAW.left)
+    overlay.handleInput('n')
+    type(overlay, 'later')
+    overlay.handleInput(RAW.enter)
+    overlay.handleInput(RAW.enter)
+    overlay.handleInput(RAW.enter)
+
+    expect((await result).content[0].text, 'The option should survive the notes').toContain('Which layout?\nUser selected: 1. Sidebar\nSelected preview:\nSIDEBAR MOCK\nUser notes: later')
+  })
+
+  it('should mark the question answered and advance when Enter confirms notes in a batch', () => {
+    const { overlay, screen } = openPreview(batch())
+    overlay.handleInput('n')
+    type(overlay, 'q1')
+    overlay.handleInput(RAW.enter)
+
+    const text = screen().join('\n')
+
+    expect(text, 'The tab should read answered').toContain('☒ Layout')
+    expect(text, 'The form should move to the next question').toContain('Which color?')
+  })
+
+  it('should list a notes-only answer as (notes only) when the review is shown', () => {
+    const { overlay, screen } = openPreview(batch())
+    overlay.handleInput('n')
+    type(overlay, 'q1')
+    overlay.handleInput(RAW.enter)
+    overlay.handleInput(RAW.tab)
+
+    expect(screen(), 'The review should name the notes-only answer').toContain('   → (notes only)')
+  })
+
+  it('should leave a notes-only answer unanswered when its notes are emptied', () => {
+    const { overlay, screen } = openPreview(batch())
+    overlay.handleInput('n')
+    overlay.handleInput('x')
+    overlay.handleInput(RAW.enter)
+    overlay.handleInput(RAW.left)
+    overlay.handleInput('n')
+    overlay.handleInput('\x7f')
+    overlay.handleInput(RAW.escape)
+
+    expect(screen().join('\n'), 'Emptied notes should no longer answer the question').toContain('☐ Layout')
+  })
+
+  it('should leave out the notes when a question with notes is skipped', async () => {
+    const { overlay, result } = openPreview(batch())
+    overlay.handleInput('n')
+    type(overlay, 'unsent')
+    overlay.handleInput(RAW.escape)
+    overlay.handleInput(RAW.tab)
+    overlay.handleInput(RAW.tab)
+    overlay.handleInput(RAW.enter)
+
+    expect((await result).content[0].text, 'A skipped question should send no notes').not.toContain('unsent')
+  })
+
+  it('should replace the notes with the external editor text when Ctrl+G is pressed in them', async () => {
+    editTextExternally.mockResolvedValueOnce('from\neditor')
+    const { overlay, result } = openPreview(single())
+    overlay.handleInput('n')
+    type(overlay, 'draft')
+    overlay.handleInput(RAW.ctrlG)
+    await vi.waitFor(() => expect(editTextExternally).toHaveBeenCalledWith(expect.anything(), '/usr/bin/vim -f', 'draft'))
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    overlay.handleInput(RAW.enter)
+
+    expect((await result).content[0].text, 'The edited notes should be sent').toBe('User selected: (no option selected)\nUser notes: from\neditor')
+  })
+
+  it('should add the notes under the answer when Chat about this is chosen', async () => {
+    const { overlay, result } = openPreview(single())
+    overlay.handleInput('n')
+    type(overlay, 'chat note')
+    overlay.handleInput(RAW.escape)
+    overlay.handleInput(RAW.down)
+    overlay.handleInput(RAW.down)
+    overlay.handleInput(RAW.enter)
+
+    expect((await result).content[0].text, 'The clarify text should carry the notes').toContain('- "Which layout?"\n  (No answer provided)\n  User notes: chat note')
+  })
+
+  it('should leave out the preview when the chosen option has none', async () => {
+    const { overlay, result } = openPreview(single())
+    overlay.handleInput(RAW.down)
+    overlay.handleInput(RAW.enter)
+
+    expect((await result).content[0].text, 'Only a previewed option should send its preview').toBe('User selected: 2. Plain')
+  })
+
+  it('should render a notes-only answer as (notes only) when the result is shown', () => {
+    const result = { content: [], details: { question: 'Pick one', options: ['Alpha'], answer: '', wasCustom: false, notes: 'n' } }
+
+    expect(lines(setup().renderResult(result as never, undefined, theme)), 'A notes-only answer should be named').toEqual(['✓ (notes only)'])
+  })
+
+  it('should send the previews when a remote responder is offered the question', async () => {
+    let offer: RemoteQuestionOffer | undefined
+    const tool = setupRemote((request) => {
+      offer = request
+    })
+    void tool.execute('call-1', single() as never, undefined, undefined, { ...uiCtx(null), sessionManager: { getSessionId: () => 's' } })
+
+    expect(offer?.options, 'The offer should carry each preview').toEqual([
+      { label: 'Sidebar', description: 'Nav on the left', preview: 'SIDEBAR MOCK' },
+      { label: 'Plain', description: 'No preview here' },
+    ])
+    expect(offer?.allowFreeText, 'A previewed question has no free-text row').toBe(false)
+  })
+
+  it('should reject remote free text when the question shows previews', () => {
+    let settle: ReturnType<RemoteQuestionOffer['claim']>
+    const tool = setupRemote((request) => {
+      settle = request.claim()
+    })
+    void tool.execute('call-1', single() as never, undefined, undefined, { ...uiCtx(new Promise(() => {})), sessionManager: { getSessionId: () => 's' } })
+
+    expect(settle?.({ action: 'text', text: 'free' }), 'Free text should not answer a previewed question').toBe(false)
   })
 })
